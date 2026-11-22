@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime logs and failure snapshots (preserve directory placeholders)
+logs/*.log
+logs/failures/*
+!logs/failures/.gitkeep
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

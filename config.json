@@ -1,0 +1,66 @@
+{
+  "place_id": "113140456364856",
+  "window": {
+    "x": 0,
+    "y": 0,
+    "width": 1280,
+    "height": 720,
+    "size_mode": "window"
+  },
+  "thresholds": {
+    "btn_battle": 0.85,
+    "modal_disconnected": 0.85,
+    "btn_reconnect": 0.85,
+    "btn_yes_continue": 0.85,
+    "btn_continue": 0.85,
+    "btn_start_over": 0.85,
+    "hud_in_run": 0.85,
+    "dismiss": 0.85
+  },
+  "rois": {
+    "btn_battle": [0.42, 0.75, 0.70, 1.0],
+    "modal_disconnected": [0.15, 0.15, 0.85, 0.85],
+    "btn_reconnect": [0.15, 0.15, 0.85, 0.85],
+    "btn_yes_continue": [0.30, 0.42, 0.72, 0.72],
+    "btn_start_over": [0.30, 0.42, 0.72, 0.72],
+    "btn_continue": [0.42, 0.75, 0.70, 1.0],
+    "hud_in_run": [0.22, 0.74, 0.78, 1.0]
+  },
+  "polling": {
+    "menu_interval_sec": 1.0,
+    "in_run_interval_sec": 4.0,
+    "click_confirm_timeout_sec": 3.0,
+    "click_confirm_poll_sec": 0.4,
+    "post_launch_settle_sec": 2.0
+  },
+  "timeouts": {
+    "launching_sec": 180.0,
+    "launching_update_grace_sec": 300.0,
+    "ready_to_start_sec": 120.0,
+    "in_run_sec": 2700.0,
+    "disconnected_sec": 90.0
+  },
+  "anti_afk": {
+    "enabled": true,
+    "interval_sec": 720.0,
+    "method": "key_tap",
+    "key": "space"
+  },
+  "recovery": {
+    "max_reconnect_retries": 2,
+    "reconnect_wait_sec": 10.0,
+    "max_click_retries": 5,
+    "circuit_breaker_max_triggers": 5,
+    "circuit_breaker_window_sec": 900.0,
+    "resume_mode": "continue"
+  },
+  "logging": {
+    "max_failure_snapshots": 20
+  },
+  "ui": {
+    "panel_width": 380,
+    "panel_height": 720,
+    "panel_gap": 12
+  },
+  "hotkey": "F8"
+}
