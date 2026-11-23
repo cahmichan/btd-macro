@@ -15,6 +15,7 @@ import numpy as np
 
 from src.config import AppConfig
 from src.controller import RobloxController
+from src.upgrade_vision import TreeScanResult, detect_affordable_upgrades, is_same_candidate
 from src.vision import REQUIRED_TEMPLATES, VisionEngine
 from src.win32_utils import allow_sleep, prevent_sleep
 
@@ -25,6 +26,7 @@ class MacroState(str, Enum):
     IDLE = "IDLE"
     LAUNCHING = "LAUNCHING"
     READY_TO_START = "READY_TO_START"
+    UPGRADING = "UPGRADING"
     IN_RUN = "IN_RUN"
     DISCONNECTED = "DISCONNECTED"
     WATCHDOG_RECOVERY = "WATCHDOG_RECOVERY"
@@ -35,6 +37,7 @@ class MacroStats:
     """Live counters and confidence metrics reported to the UI."""
 
     runs_completed: int = 0
+    upgrades_purchased: int = 0
     disconnects: int = 0
     watchdog_recoveries: int = 0
     consecutive_recoveries: int = 0
@@ -60,6 +63,7 @@ class MacroStateMachine:
         clock: Callable[[], float] = time.monotonic,
         sleep_prevent_fn: Callable[[], bool] = prevent_sleep,
         sleep_allow_fn: Callable[[], bool] = allow_sleep,
+        upgrade_scanner: Callable[..., TreeScanResult] = detect_affordable_upgrades,
     ) -> None:
         self.config = config
         self.vision = vision
@@ -68,6 +72,7 @@ class MacroStateMachine:
         self.clock = clock
         self.sleep_prevent_fn = sleep_prevent_fn
         self.sleep_allow_fn = sleep_allow_fn
+        self.upgrade_scanner = upgrade_scanner
 
         self.stop_event = threading.Event()
         self.state = MacroState.IDLE
@@ -93,6 +98,8 @@ class MacroStateMachine:
         self._last_frame: Optional[np.ndarray] = None
         self._recovery_timestamps: list[float] = []
         self._hud_missing_streak = 0
+        self._pending_upgrade_pass = False
+        self._stop_reason: Optional[str] = None
 
     @property
     def is_running(self) -> bool:
@@ -137,11 +144,25 @@ class MacroStateMachine:
                     "Optional active-run template assets/hud_in_run.png not found "
                     "(capture the red STOP button via calibrate.bat so the macro can detect an active wave).",
                 )
+            if self.config.auto_upgrade.enabled:
+                missing_up = [
+                    t for t in ("btn_upgrades", "btn_upgrades_close") if not self.vision.has_template(t)
+                ]
+                if missing_up:
+                    self._emit_log(
+                        "WARN",
+                        f"Auto-Upgrade is enabled, but missing template(s): {', '.join(missing_up)}. "
+                        "Run calibrate.bat to capture them.",
+                    )
 
             self.dry_run = dry_run
             self.stop_event.clear()
+            self._stop_reason = None
             self.stats = MacroStats()
             self._recovery_timestamps.clear()
+            self._pending_upgrade_pass = bool(
+                self.config.auto_upgrade.enabled and self.config.auto_upgrade.run_on_start
+            )
             self.started_at = self.clock()
             self._transition_to(MacroState.LAUNCHING)
 
@@ -171,7 +192,9 @@ class MacroStateMachine:
             while not self.stop_event.is_set():
                 delay = self.step()
                 if delay is None:
-                    if self.stats.circuit_breaker_tripped:
+                    if self._stop_reason:
+                        stop_reason = self._stop_reason
+                    elif self.stats.circuit_breaker_tripped:
                         stop_reason = "Circuit breaker tripped"
                     break
                 if delay > 0:
@@ -207,6 +230,8 @@ class MacroStateMachine:
             return self._step_launching()
         if self.state == MacroState.READY_TO_START:
             return self._step_ready_to_start()
+        if self.state == MacroState.UPGRADING:
+            return self._step_upgrading()
         if self.state == MacroState.IN_RUN:
             return self._step_in_run()
         if self.state == MacroState.DISCONNECTED:
@@ -221,6 +246,8 @@ class MacroStateMachine:
             return t.launching_sec + (t.launching_update_grace_sec if self._update_grace_active else 0.0)
         if self.state == MacroState.READY_TO_START:
             return t.ready_to_start_sec
+        if self.state == MacroState.UPGRADING:
+            return t.upgrading_sec
         if self.state == MacroState.IN_RUN:
             return t.in_run_sec
         if self.state == MacroState.DISCONNECTED:
@@ -257,6 +284,14 @@ class MacroStateMachine:
         if frame is not None:
             self._last_frame = frame
         return hwnd, frame
+
+    def _can_run_auto_upgrade(self) -> bool:
+        """Return True when auto-upgrade is enabled and required UI templates exist."""
+        return bool(
+            self.config.auto_upgrade.enabled
+            and self.vision.has_template("btn_upgrades")
+            and self.vision.has_template("btn_upgrades_close")
+        )
 
     def _active_resume_spec(self) -> tuple[str, float, list[float]]:
         """Return (template_name, threshold, roi) for the configured mid-run disconnect mode."""
@@ -377,6 +412,11 @@ class MacroStateMachine:
             )
 
         if battle.found and battle.center is not None:
+            if self._pending_upgrade_pass:
+                self._pending_upgrade_pass = False
+                if self._can_run_auto_upgrade():
+                    self._transition_to(MacroState.UPGRADING)
+                    return 0.0
             if self.dry_run:
                 self._emit_log("INFO", _dry_run_summary())
                 return menu_poll
@@ -390,6 +430,17 @@ class MacroStateMachine:
                 focus_fail_reason="battle_click_focus_failed",
                 unconfirmed_reason="battle_click_unconfirmed",
             )
+
+        if self.dry_run and self.config.auto_upgrade.enabled and self.vision.has_template("btn_upgrades_close"):
+            close_vis = self.vision.find(
+                frame,
+                "btn_upgrades_close",
+                self.config.thresholds.btn_upgrades_close,
+                self.config.rois.btn_upgrades_close,
+            )
+            if close_vis.found:
+                self._transition_to(MacroState.UPGRADING)
+                return 0.0
 
         if cont_btn.found and cont_btn.center is not None:
             if self.dry_run:
@@ -537,6 +588,401 @@ class MacroStateMachine:
             return 0.0
         return polling.menu_interval_sec
 
+    def _step_upgrading(self) -> Optional[float]:
+        if self.stop_event.is_set():
+            return None
+
+        cfg = self.config.auto_upgrade
+        th = self.config.thresholds
+        rois = self.config.rois
+        polling = self.config.polling
+
+        hwnd, frame = self._capture_current_frame()
+        if frame is None:
+            if self.dry_run:
+                self._emit_log("WARN", "Dry-Run (UPGRADING): unable to capture Roblox client frame.")
+                self._transition_to(MacroState.READY_TO_START)
+                return polling.menu_interval_sec
+            if not self.controller.is_roblox_running():
+                self._disconnect_reason = "process_exited_upgrading"
+                self._transition_to(MacroState.DISCONNECTED)
+                return 0.0
+            self._emit_log("WARN", "Unable to capture frame in UPGRADING; returning to READY_TO_START.")
+            self._transition_to(MacroState.READY_TO_START)
+            return polling.menu_interval_sec
+
+        disc = self.vision.find(frame, "modal_disconnected", th.modal_disconnected, rois.modal_disconnected)
+        if disc.found:
+            if self.dry_run:
+                self._emit_log("INFO", "Dry-Run (UPGRADING): disconnect modal visible.")
+                self._transition_to(MacroState.READY_TO_START)
+                return polling.menu_interval_sec
+            self._disconnect_reason = "modal_disconnected_upgrading"
+            self._transition_to(MacroState.DISCONNECTED)
+            return 0.0
+
+        if self.dry_run:
+            close_vis = self.vision.find(frame, "btn_upgrades_close", th.btn_upgrades_close, rois.btn_upgrades_close)
+            if close_vis.found:
+                scan = self.upgrade_scanner(
+                    frame,
+                    scope=cfg.scope,
+                    order=cfg.order,
+                    tile_click_y_offset_px=cfg.tile_click_y_offset_px,
+                )
+                main_cands = [c for c in scan.all_candidates if c.is_main_tree]
+                side_cands = [c for c in scan.all_candidates if not c.is_main_tree]
+                coords = [c.click_point for c in scan.candidates]
+                edges = ",".join(sorted(scan.clipped_edges)) if scan.clipped_edges else "none"
+                self._emit_log(
+                    "INFO",
+                    f"Dry-Run (UPGRADING): {len(main_cands)} main-tree and {len(side_cands)} side-island "
+                    f"affordable tile(s) (scope={cfg.scope}, clipped={edges}): {coords}",
+                )
+            else:
+                up_btn = self.vision.find(frame, "btn_upgrades", th.btn_upgrades, rois.btn_upgrades)
+                self._emit_log(
+                    "INFO",
+                    f"Dry-Run (UPGRADING): tree closed; would open via btn_upgrades "
+                    f"(found={up_btn.found}, conf={up_btn.confidence:.3f}) without clicking.",
+                )
+            self._transition_to(MacroState.READY_TO_START)
+            return polling.menu_interval_sec
+
+        # 1. Open the upgrade tree if btn_upgrades_close is not already visible
+        close_btn = self.vision.find(frame, "btn_upgrades_close", th.btn_upgrades_close, rois.btn_upgrades_close)
+        if not close_btn.found:
+            up_btn = self.vision.find(frame, "btn_upgrades", th.btn_upgrades, rois.btn_upgrades)
+            if not up_btn.found or up_btn.center is None:
+                self._emit_log("WARN", "Auto-Upgrade skipped: btn_upgrades not visible in lobby.")
+                self._transition_to(MacroState.READY_TO_START)
+                return 0.0
+
+            if not self.controller.click_client_point(up_btn.center[0], up_btn.center[1], hwnd=hwnd, dry_run=False):
+                self._emit_log("WARN", "Failed to focus/click btn_upgrades; returning to READY_TO_START.")
+                self._transition_to(MacroState.READY_TO_START)
+                return 0.0
+
+            confirm_timeout = max(0.001, float(polling.click_confirm_timeout_sec))
+            poll_sec = max(0.001, float(polling.click_confirm_poll_sec))
+            max_polls = max(1, math.ceil(confirm_timeout / poll_sec))
+            deadline = self.clock() + confirm_timeout
+            opened = False
+            polls = 0
+            while True:
+                if self.stop_event.wait(poll_sec):
+                    return None
+                polls += 1
+                hwnd_open, open_frame = self._capture_current_frame()
+                if open_frame is not None:
+                    disc_open = self.vision.find(
+                        open_frame,
+                        "modal_disconnected",
+                        th.modal_disconnected,
+                        rois.modal_disconnected,
+                    )
+                    if disc_open.found:
+                        self._disconnect_reason = "modal_disconnected_upgrading"
+                        self._transition_to(MacroState.DISCONNECTED)
+                        return 0.0
+                    if self.vision.find(
+                        open_frame,
+                        "btn_upgrades_close",
+                        th.btn_upgrades_close,
+                        rois.btn_upgrades_close,
+                    ).found:
+                        hwnd = hwnd_open
+                        frame = open_frame
+                        opened = True
+                        break
+                if polls >= max_polls or self.clock() >= deadline:
+                    break
+
+            if not opened:
+                self._emit_log("WARN", "Upgrade tree did not open after clicking btn_upgrades; returning to READY_TO_START.")
+                self._transition_to(MacroState.READY_TO_START)
+                return 0.0
+
+        # 2. Deterministic zoom reset (min-zoom floor, then fixed zoom-in notches)
+        rect = self.controller.get_client_rect(hwnd)
+        client_w, client_h = (rect[2], rect[3]) if rect is not None else (1280, 720)
+        center_x, center_y = client_w // 2, client_h // 2
+
+        if int(cfg.zoom_reset_scrolls) > 0:
+            self.controller.scroll_client_point(
+                center_x,
+                center_y,
+                -abs(int(cfg.zoom_reset_scrolls)),
+                hwnd=hwnd,
+                dry_run=False,
+            )
+        if self.stop_event.is_set():
+            return None
+
+        if int(cfg.zoom_in_scrolls) > 0:
+            self.controller.scroll_client_point(
+                center_x,
+                center_y,
+                abs(int(cfg.zoom_in_scrolls)),
+                hwnd=hwnd,
+                dry_run=False,
+            )
+        if self.stop_event.is_set():
+            return None
+
+        self.controller.park_cursor_neutral(hwnd=hwnd, dry_run=False)
+        zoom_settle = min(0.25, max(0.0, float(cfg.post_click_settle_sec)))
+        if zoom_settle > 0 and self.stop_event.wait(zoom_settle):
+            return None
+        if self.stop_event.is_set():
+            return None
+
+        # 3. Scan & purchase loop helper
+        pass_deadline = self.clock() + max(0.0, float(cfg.pass_timeout_sec))
+        max_purchases = max(0, int(cfg.max_purchases_per_pass))
+        purchases_in_pass = 0
+
+        def _capture_and_scan() -> tuple[str, Optional[int], Optional[TreeScanResult]]:
+            if self.stop_event.is_set():
+                return ("stopped", None, None)
+            cur_hwnd, cur_frame = self._capture_current_frame()
+            if cur_frame is None:
+                if not self.controller.is_roblox_running():
+                    self._disconnect_reason = "process_exited_upgrading"
+                    self._transition_to(MacroState.DISCONNECTED)
+                    return ("disconnected", cur_hwnd, None)
+                return ("tree_closed", cur_hwnd, None)
+
+            cur_disc = self.vision.find(
+                cur_frame,
+                "modal_disconnected",
+                th.modal_disconnected,
+                rois.modal_disconnected,
+            )
+            if cur_disc.found:
+                self._disconnect_reason = "modal_disconnected_upgrading"
+                self._transition_to(MacroState.DISCONNECTED)
+                return ("disconnected", cur_hwnd, None)
+
+            if not self.vision.find(
+                cur_frame,
+                "btn_upgrades_close",
+                th.btn_upgrades_close,
+                rois.btn_upgrades_close,
+            ).found:
+                return ("tree_closed", cur_hwnd, None)
+
+            scan_res = self.upgrade_scanner(
+                cur_frame,
+                scope=cfg.scope,
+                order=cfg.order,
+                tile_click_y_offset_px=cfg.tile_click_y_offset_px,
+            )
+            return ("ok", cur_hwnd, scan_res)
+
+        def _upgrade_sector(sector_name: str) -> tuple[str, set[str]]:
+            nonlocal purchases_in_pass
+            status, cur_hwnd, scan = _capture_and_scan()
+            if status != "ok" or scan is None:
+                return (status, set())
+
+            sector_clipped = set(scan.clipped_edges)
+            failed_points: list[tuple[int, int]] = []
+            retry_entries: list[list[Any]] = []
+
+            def _is_blacklisted(pt: tuple[int, int]) -> bool:
+                return any(is_same_candidate(pt, fp) for fp in failed_points)
+
+            def _record_retry(pt: tuple[int, int]) -> int:
+                for entry in retry_entries:
+                    if is_same_candidate(pt, entry[0]):
+                        entry[1] += 1
+                        return int(entry[1])
+                retry_entries.append([pt, 1])
+                return 1
+
+            while True:
+                if self.stop_event.is_set():
+                    return ("stopped", sector_clipped)
+                if purchases_in_pass >= max_purchases or self.clock() >= pass_deadline:
+                    return ("budget_exhausted", sector_clipped)
+
+                target = next((c for c in scan.candidates if not _is_blacklisted(c.click_point)), None)
+                if target is None:
+                    return ("done", sector_clipped)
+
+                clicked = self.controller.click_client_point(
+                    target.click_point[0],
+                    target.click_point[1],
+                    hwnd=cur_hwnd,
+                    dry_run=False,
+                )
+                self.controller.park_cursor_neutral(hwnd=cur_hwnd, dry_run=False)
+
+                settle = max(0.0, float(cfg.post_click_settle_sec))
+                if settle > 0 and self.stop_event.wait(settle):
+                    return ("stopped", sector_clipped)
+
+                status, cur_hwnd, new_scan = _capture_and_scan()
+                if status != "ok" or new_scan is None:
+                    return (status, sector_clipped)
+
+                if not clicked:
+                    tries = _record_retry(target.click_point)
+                    if tries >= 2:
+                        failed_points.append(target.click_point)
+                        self._emit_log(
+                            "WARN",
+                            f"[{sector_name}] Failed to click upgrade at {target.click_point} twice; blacklisting.",
+                        )
+                    scan = new_scan
+                    continue
+
+                still_present = any(is_same_candidate(target.click_point, c.click_point) for c in new_scan.candidates)
+                if not still_present:
+                    purchases_in_pass += 1
+                    self.stats.upgrades_purchased += 1
+                    self._emit_metrics()
+                    self._emit_log(
+                        "INFO",
+                        f"Purchased upgrade ({sector_name}, {'main' if target.is_main_tree else 'side'}) "
+                        f"at {target.click_point} (pass #{purchases_in_pass}, session #{self.stats.upgrades_purchased}).",
+                    )
+                else:
+                    tries = _record_retry(target.click_point)
+                    if tries >= 2:
+                        failed_points.append(target.click_point)
+                        self._emit_log(
+                            "WARN",
+                            f"Upgrade at {target.click_point} remained affordable after {tries} clicks; blacklisting.",
+                        )
+
+                scan = new_scan
+
+        status, center_clipped = _upgrade_sector("center")
+        if status in ("stopped", "disconnected"):
+            return None if status == "stopped" else 0.0
+
+        # 4. Adaptive edge panning if main tree touches viewport boundaries
+        if (
+            status == "done"
+            and cfg.enable_edge_panning
+            and center_clipped
+            and purchases_in_pass < max_purchases
+            and self.clock() < pass_deadline
+        ):
+            half_pan = max(20, abs(int(cfg.pan_drag_px)) // 2)
+            pan_vectors: dict[str, tuple[int, int, int, int]] = {
+                "top": (center_x, center_y - half_pan, center_x, center_y + half_pan),
+                "bottom": (center_x, center_y + half_pan, center_x, center_y - half_pan),
+                "left": (center_x - half_pan, center_y, center_x + half_pan, center_y),
+                "right": (center_x + half_pan, center_y, center_x - half_pan, center_y),
+            }
+            for direction in ("top", "bottom", "left", "right"):
+                if direction not in center_clipped:
+                    continue
+                if self.stop_event.is_set():
+                    return None
+                if purchases_in_pass >= max_purchases or self.clock() >= pass_deadline:
+                    break
+
+                x1, y1, x2, y2 = pan_vectors[direction]
+                if not self.controller.drag_client_points(x1, y1, x2, y2, hwnd=hwnd, dry_run=False):
+                    continue
+                self.controller.park_cursor_neutral(hwnd=hwnd, dry_run=False)
+                if zoom_settle > 0 and self.stop_event.wait(zoom_settle):
+                    return None
+
+                pan_status, _ = _upgrade_sector(f"pan-{direction}")
+                if pan_status in ("stopped", "disconnected"):
+                    return None if pan_status == "stopped" else 0.0
+
+                # Pan back toward center before exploring another edge or closing
+                self.controller.drag_client_points(x2, y2, x1, y1, hwnd=hwnd, dry_run=False)
+                self.controller.park_cursor_neutral(hwnd=hwnd, dry_run=False)
+                if zoom_settle > 0 and self.stop_event.wait(zoom_settle):
+                    return None
+
+                if pan_status in ("tree_closed", "budget_exhausted"):
+                    break
+
+        # 5. Close upgrade tree (up to 3 attempts, Esc fallback)
+        close_timeout = max(0.001, float(polling.click_confirm_timeout_sec))
+        close_poll = max(0.001, float(polling.click_confirm_poll_sec))
+        close_max_polls = max(1, math.ceil(close_timeout / close_poll))
+        for attempt in range(3):
+            if self.stop_event.is_set():
+                return None
+            hwnd_close, close_frame = self._capture_current_frame()
+            if close_frame is None:
+                break
+            disc_close = self.vision.find(
+                close_frame,
+                "modal_disconnected",
+                th.modal_disconnected,
+                rois.modal_disconnected,
+            )
+            if disc_close.found:
+                self._disconnect_reason = "modal_disconnected_upgrading"
+                self._transition_to(MacroState.DISCONNECTED)
+                return 0.0
+
+            close_vis = self.vision.find(
+                close_frame,
+                "btn_upgrades_close",
+                th.btn_upgrades_close,
+                rois.btn_upgrades_close,
+            )
+            if not close_vis.found:
+                break
+
+            if close_vis.center is not None:
+                self.controller.click_client_point(
+                    close_vis.center[0],
+                    close_vis.center[1],
+                    hwnd=hwnd_close,
+                    dry_run=False,
+                )
+
+            closed_ok = False
+            close_deadline = self.clock() + close_timeout
+            for _ in range(close_max_polls):
+                if self.stop_event.wait(close_poll):
+                    return None
+                _, check_frame = self._capture_current_frame()
+                if check_frame is None:
+                    closed_ok = True
+                    break
+                if not self.vision.find(
+                    check_frame,
+                    "btn_upgrades_close",
+                    th.btn_upgrades_close,
+                    rois.btn_upgrades_close,
+                ).found:
+                    closed_ok = True
+                    break
+                if self.clock() >= close_deadline:
+                    break
+
+            if closed_ok:
+                break
+
+            self._emit_log(
+                "WARN",
+                f"btn_upgrades_close still visible after click (attempt {attempt + 1}/3); sending Esc fallback.",
+            )
+            self.controller.send_key("esc", hwnd=hwnd_close, dry_run=False)
+            if self.stop_event.wait(close_poll):
+                return None
+
+        self._emit_log(
+            "INFO",
+            f"Auto-Upgrade pass complete: bought {purchases_in_pass} upgrade(s) "
+            f"(session total: {self.stats.upgrades_purchased}).",
+        )
+        self._transition_to(MacroState.READY_TO_START)
+        return 0.0
+
     def _step_in_run(self) -> Optional[float]:
         run_poll = self.config.polling.in_run_interval_sec
 
@@ -588,6 +1034,9 @@ class MacroStateMachine:
                 "INFO",
                 f"Run #{self.stats.runs_completed} completed (Battle button reappeared).",
             )
+            every_n = max(1, int(self.config.auto_upgrade.every_n_runs))
+            if self._can_run_auto_upgrade() and (self.stats.runs_completed % every_n == 0):
+                self._pending_upgrade_pass = True
             self._emit_metrics()
             self._transition_to(MacroState.READY_TO_START)
             return 0.0
@@ -622,6 +1071,35 @@ class MacroStateMachine:
     def _step_disconnected(self) -> Optional[float]:
         menu_poll = self.config.polling.menu_interval_sec
         hwnd, frame = self._capture_current_frame()
+
+        # Feature 1: Same-account disconnect guard (Error 273) before reconnect/relaunch
+        if (
+            frame is not None
+            and self.config.recovery.stop_on_same_account
+            and self.vision.has_template("modal_same_account")
+        ):
+            same_acct = self.vision.find(
+                frame,
+                "modal_same_account",
+                self.config.thresholds.modal_same_account,
+                self.config.rois.modal_same_account,
+            )
+            if same_acct.found:
+                if not self._disconnect_handled:
+                    self._disconnect_handled = True
+                    self.stats.disconnects += 1
+                snap = self.vision.save_failure_snapshot(frame, "same_account_disconnect")
+                snap_msg = f" Saved snapshot {snap.name}." if snap is not None else ""
+                self._stop_reason = "Same account launched on another device (Error 273)"
+                self._emit_log(
+                    "WARN",
+                    "Detected Roblox Error 273 (same account launched on another device). "
+                    f"Stopping macro cleanly without reconnecting or relaunching Roblox.{snap_msg}",
+                )
+                self._emit_metrics()
+                self._transition_to(MacroState.IDLE)
+                self.stop_event.set()
+                return None
 
         if not self._disconnect_handled:
             self._disconnect_handled = True

@@ -27,11 +27,14 @@ class ThresholdConfig:
 
     btn_battle: float = 0.85
     modal_disconnected: float = 0.85
+    modal_same_account: float = 0.85
     btn_reconnect: float = 0.85
     btn_yes_continue: float = 0.85
     btn_continue: float = 0.85
     btn_start_over: float = 0.85
     hud_in_run: float = 0.85
+    btn_upgrades: float = 0.85
+    btn_upgrades_close: float = 0.85
     dismiss: float = 0.85
 
 
@@ -41,11 +44,14 @@ class RoiConfig:
 
     btn_battle: list[float] = field(default_factory=lambda: [0.42, 0.75, 0.70, 1.0])
     modal_disconnected: list[float] = field(default_factory=lambda: [0.15, 0.15, 0.85, 0.85])
+    modal_same_account: list[float] = field(default_factory=lambda: [0.15, 0.15, 0.85, 0.85])
     btn_reconnect: list[float] = field(default_factory=lambda: [0.15, 0.15, 0.85, 0.85])
     btn_yes_continue: list[float] = field(default_factory=lambda: [0.30, 0.42, 0.72, 0.72])
     btn_start_over: list[float] = field(default_factory=lambda: [0.30, 0.42, 0.72, 0.72])
     btn_continue: list[float] = field(default_factory=lambda: [0.42, 0.75, 0.70, 1.0])
     hud_in_run: list[float] = field(default_factory=lambda: [0.22, 0.74, 0.78, 1.0])
+    btn_upgrades: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
+    btn_upgrades_close: list[float] = field(default_factory=lambda: [0.38, 0.85, 0.62, 1.0])
 
 
 @dataclass
@@ -66,6 +72,7 @@ class TimeoutConfig:
     launching_sec: float = 180.0
     launching_update_grace_sec: float = 300.0
     ready_to_start_sec: float = 120.0
+    upgrading_sec: float = 60.0
     in_run_sec: float = 2700.0
     disconnected_sec: float = 90.0
 
@@ -90,6 +97,26 @@ class RecoveryConfig:
     circuit_breaker_max_triggers: int = 5
     circuit_breaker_window_sec: float = 900.0
     resume_mode: str = "continue"  # "continue" (Yes, continue) or "start_over" (Start over)
+    stop_on_same_account: bool = True
+
+
+@dataclass
+class AutoUpgradeConfig:
+    """Between-run and startup hex upgrade tree automation settings."""
+
+    enabled: bool = False
+    every_n_runs: int = 1
+    run_on_start: bool = True
+    scope: str = "main_only"  # "main_only" or "main_then_sides"
+    order: str = "center_first"  # "center_first" or "top_down"
+    zoom_reset_scrolls: int = 15
+    zoom_in_scrolls: int = 5
+    enable_edge_panning: bool = True
+    pan_drag_px: int = 260
+    max_purchases_per_pass: int = 25
+    pass_timeout_sec: float = 45.0
+    post_click_settle_sec: float = 0.35
+    tile_click_y_offset_px: int = -14
 
 
 @dataclass
@@ -120,6 +147,7 @@ class AppConfig:
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     anti_afk: AntiAfkConfig = field(default_factory=AntiAfkConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    auto_upgrade: AutoUpgradeConfig = field(default_factory=AutoUpgradeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     hotkey: str = "F8"

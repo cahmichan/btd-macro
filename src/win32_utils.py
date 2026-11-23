@@ -26,8 +26,11 @@ INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_ABSOLUTE = 0x8000
+
+WHEEL_DELTA = 120
 
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
@@ -412,6 +415,85 @@ def click_screen_point(screen_x: int, screen_y: int, hover_nudge_px: int = 2) ->
     )
     _send_inputs(down)
     time.sleep(0.05)
+    _send_inputs(up)
+
+
+def scroll_mouse_wheel(notches: int, step_delay_sec: float = 0.03) -> None:
+    """Scroll the vertical mouse wheel via SendInput (positive=up/zoom-in, negative=down/zoom-out)."""
+    count = abs(int(notches))
+    if count == 0:
+        return
+
+    direction = 1 if notches > 0 else -1
+    delta_dword = (direction * WHEEL_DELTA) & 0xFFFFFFFF
+
+    for idx in range(count):
+        inp = INPUT(
+            type=INPUT_MOUSE,
+            mi=MOUSEINPUT(
+                dx=0,
+                dy=0,
+                mouseData=delta_dword,
+                dwFlags=MOUSEEVENTF_WHEEL,
+                time=0,
+                dwExtraInfo=0,
+            ),
+        )
+        _send_inputs(inp)
+        if step_delay_sec > 0 and idx + 1 < count:
+            time.sleep(step_delay_sec)
+
+
+def drag_screen_points(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    steps: int = 12,
+    duration_sec: float = 0.25,
+) -> None:
+    """Smoothly drag with the left mouse button between two screen coordinates via SendInput."""
+    start_x, start_y = int(x1), int(y1)
+    end_x, end_y = int(x2), int(y2)
+    move_mouse_abs(start_x, start_y)
+    time.sleep(0.03)
+
+    down = INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(
+            dx=0,
+            dy=0,
+            mouseData=0,
+            dwFlags=MOUSEEVENTF_LEFTDOWN,
+            time=0,
+            dwExtraInfo=0,
+        ),
+    )
+    up = INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(
+            dx=0,
+            dy=0,
+            mouseData=0,
+            dwFlags=MOUSEEVENTF_LEFTUP,
+            time=0,
+            dwExtraInfo=0,
+        ),
+    )
+    _send_inputs(down)
+    time.sleep(0.03)
+
+    num_steps = max(1, int(steps))
+    step_sleep = max(0.0, float(duration_sec)) / num_steps
+    for idx in range(1, num_steps + 1):
+        frac = idx / num_steps
+        ix = int(round(start_x + (end_x - start_x) * frac))
+        iy = int(round(start_y + (end_y - start_y) * frac))
+        move_mouse_abs(ix, iy)
+        if step_sleep > 0:
+            time.sleep(step_sleep)
+
+    time.sleep(0.03)
     _send_inputs(up)
 
 

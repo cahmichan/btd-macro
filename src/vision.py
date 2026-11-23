@@ -30,6 +30,9 @@ OPTIONAL_TEMPLATES: tuple[str, ...] = (
     "btn_yes_continue",
     "btn_continue",
     "btn_start_over",
+    "modal_same_account",
+    "btn_upgrades",
+    "btn_upgrades_close",
 )
 
 

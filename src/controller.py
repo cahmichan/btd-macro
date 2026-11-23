@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 import psutil
@@ -10,6 +11,7 @@ import psutil
 from src.config import AppConfig
 from src.win32_utils import (
     click_screen_point,
+    drag_screen_points,
     enforce_window_layout,
     find_pids_by_name,
     find_roblox_hwnd,
@@ -18,6 +20,7 @@ from src.win32_utils import (
     is_process_running,
     move_mouse_abs,
     move_mouse_relative,
+    scroll_mouse_wheel,
     send_key_tap,
 )
 
@@ -136,6 +139,100 @@ class RobloxController:
         # Park cursor in a neutral area so hover effects don't linger on buttons
         move_mouse_abs(left + 20, top + max(20, int(height * 0.5)))
         return True
+
+    def scroll_client_point(
+        self,
+        client_x: int,
+        client_y: int,
+        notches: int,
+        hwnd: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> bool:
+        """Focus Roblox, move to client coordinates, and send mouse wheel notches."""
+        if dry_run:
+            return True
+
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        if target is None or not self.focus(target):
+            return False
+
+        rect = self.get_client_rect(target)
+        if rect is None:
+            return False
+
+        left, top, width, height = rect
+        if client_x < 0 or client_y < 0 or client_x >= width or client_y >= height:
+            return False
+
+        move_mouse_abs(left + int(client_x), top + int(client_y))
+        time.sleep(0.03)
+        scroll_mouse_wheel(notches)
+        return True
+
+    def drag_client_points(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        hwnd: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> bool:
+        """Focus Roblox and drag cleanly between two clamped client-area coordinates."""
+        if dry_run:
+            return True
+
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        if target is None or not self.focus(target):
+            return False
+
+        rect = self.get_client_rect(target)
+        if rect is None:
+            return False
+
+        left, top, width, height = rect
+        if width <= 8 or height <= 8:
+            return False
+
+        cx1 = max(4, min(width - 5, int(x1)))
+        cy1 = max(4, min(height - 5, int(y1)))
+        cx2 = max(4, min(width - 5, int(x2)))
+        cy2 = max(4, min(height - 5, int(y2)))
+        drag_screen_points(left + cx1, top + cy1, left + cx2, top + cy2)
+        return True
+
+    def park_cursor_neutral(self, hwnd: Optional[int] = None, dry_run: bool = False) -> bool:
+        """Move cursor to top-left empty margin so hover tooltips never block hex tiles."""
+        if dry_run:
+            return True
+
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        if target is None:
+            return False
+
+        rect = self.get_client_rect(target)
+        if rect is None:
+            return False
+
+        left, top, width, height = rect
+        if width <= 0 or height <= 0:
+            return False
+
+        park_x = left + min(20, max(0, width - 1))
+        park_y = top + min(120, max(0, height - 1))
+        move_mouse_abs(park_x, park_y)
+        return True
+
+    def send_key(self, key: str, hwnd: Optional[int] = None, dry_run: bool = False) -> bool:
+        """Focus Roblox and send a single key tap."""
+        if dry_run:
+            return True
+
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        if target is None or not self.focus(target):
+            return False
+
+        return send_key_tap(key)
 
     def send_anti_afk(self, hwnd: Optional[int] = None, dry_run: bool = False) -> bool:
         """Send a focus-verified neutral input to reset Roblox's 20-minute idle timer."""

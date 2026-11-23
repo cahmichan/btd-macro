@@ -11,8 +11,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from src.config import get_assets_dir, get_dismiss_dir, load_config
+from src.config import get_assets_dir, get_dismiss_dir, get_logs_dir, load_config
 from src.controller import RobloxController
+from src.upgrade_vision import detect_affordable_upgrades, render_upgrade_debug_overlay
 from src.vision import (
     OPTIONAL_TEMPLATES,
     REQUIRED_TEMPLATES,
@@ -167,6 +168,24 @@ def run_confidence_monitor(
                 cfg.thresholds.hud_in_run,
                 cfg.rois.hud_in_run,
             )
+            up = vision.find(
+                frame,
+                "btn_upgrades",
+                cfg.thresholds.btn_upgrades,
+                cfg.rois.btn_upgrades,
+            )
+            up_close = vision.find(
+                frame,
+                "btn_upgrades_close",
+                cfg.thresholds.btn_upgrades_close,
+                cfg.rois.btn_upgrades_close,
+            )
+            same_acct = vision.find(
+                frame,
+                "modal_same_account",
+                cfg.thresholds.modal_same_account,
+                cfg.rois.modal_same_account,
+            )
             dismiss = vision.find_dismiss_target(frame, cfg.thresholds.dismiss)
 
             parts = [
@@ -178,12 +197,87 @@ def run_confidence_monitor(
             ]
             if vision.has_template("btn_continue"):
                 parts.append(f"Continue={cont.confidence:.3f}{'*' if cont.found else ''}")
+            if vision.has_template("btn_upgrades"):
+                parts.append(f"Upgrades={up.confidence:.3f}{'*' if up.found else ''}")
+            if vision.has_template("btn_upgrades_close"):
+                parts.append(f"UpgradesClose={up_close.confidence:.3f}{'*' if up_close.found else ''}")
+            if vision.has_template("modal_same_account"):
+                parts.append(f"SameAcct={same_acct.confidence:.3f}{'*' if same_acct.found else ''}")
             if dismiss is not None:
                 parts.append(f"{dismiss.template_name}={dismiss.confidence:.3f}*")
             print(" | ".join(parts))
             time.sleep(interval_sec)
     except KeyboardInterrupt:
         print("\n[STOPPED] Confidence monitor stopped.")
+
+
+def run_test_upgrades(
+    controller: RobloxController,
+    vision: VisionEngine,
+    image_path: Optional[Path] = None,
+    scope: Optional[str] = None,
+    resize_1280x720: bool = False,
+    no_gui: bool = False,
+) -> int:
+    """Run upgrade tree vision on a live Roblox frame or PNG file and save an annotated preview."""
+    frame = _capture_source_frame(controller, vision, from_image=image_path)
+    if frame is None:
+        return 1
+
+    if resize_1280x720 and (frame.shape[1], frame.shape[0]) != (1280, 720):
+        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
+
+    cfg = controller.config.auto_upgrade
+    active_scope = scope or cfg.scope
+    result = detect_affordable_upgrades(
+        frame,
+        scope=active_scope,
+        order=cfg.order,
+        tile_click_y_offset_px=cfg.tile_click_y_offset_px,
+    )
+
+    main_cands = [c for c in result.all_candidates if c.is_main_tree]
+    side_cands = [c for c in result.all_candidates if not c.is_main_tree]
+    edges_str = ",".join(sorted(result.clipped_edges)) if result.clipped_edges else "none"
+
+    print(
+        f"\n[UPGRADE VISION] frame={frame.shape[1]}x{frame.shape[0]} | scope={active_scope} | "
+        f"main_bbox={result.main_tree_bbox} | clipped_edges={edges_str}"
+    )
+    print(
+        f"  Detected: main={len(main_cands)}, side={len(side_cands)}, "
+        f"active({active_scope})={len(result.candidates)}"
+    )
+    for idx, cand in enumerate(result.candidates, start=1):
+        tree_label = "MAIN" if cand.is_main_tree else "SIDE"
+        print(
+            f"  #{idx:02d} [{tree_label}] click={cand.click_point} price={cand.price_center} "
+            f"bbox={cand.bbox} dist={cand.distance_from_center:.1f} px={cand.raw_pixels}"
+        )
+
+    skipped_sides = [c for c in result.all_candidates if c not in result.candidates]
+    if skipped_sides:
+        print(f"  Skipped side candidates ({len(skipped_sides)}):")
+        for cand in skipped_sides:
+            print(
+                f"    [SIDE-SKIP] click={cand.click_point} price={cand.price_center} "
+                f"bbox={cand.bbox} px={cand.raw_pixels}"
+            )
+
+    preview = render_upgrade_debug_overlay(frame, result, scope=active_scope)
+    preview_path = get_logs_dir() / "upgrade_vision_preview.png"
+    if _write_png_image(preview_path, preview):
+        print(f"[SAVED] Annotated preview written to {preview_path}")
+    else:
+        print(f"[WARN] Could not write annotated preview to {preview_path}")
+
+    if not no_gui:
+        win_title = "Upgrade Vision Preview (Press any key to close)"
+        cv2.imshow(win_title, preview)
+        cv2.waitKey(0)
+        cv2.destroyWindow(win_title)
+
+    return 0
 
 
 def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int:
@@ -197,6 +291,9 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
         "7": "btn_yes_continue",
         "8": "btn_continue",
         "9": "btn_start_over",
+        "10": "modal_same_account",
+        "11": "btn_upgrades",
+        "12": "btn_upgrades_close",
     }
 
     while True:
@@ -206,15 +303,19 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
         print("3. Capture & crop btn_battle.png")
         print("4. Capture & crop modal_disconnected.png")
         print("5. Capture & crop btn_reconnect.png")
-        print("6. Capture & crop hud_in_run.png        (Recommended: red STOP button / wave HUD)")
-        print("7. Capture & crop btn_yes_continue.png  (Recommended mid-run resume button)")
-        print("8. Capture & crop btn_continue.png      (Optional bottom Continue button)")
-        print("9. Capture & crop btn_start_over.png    (Optional Start Over button)")
-        print("10. Capture & crop optional dismiss/*.png popup")
-        print("11. Live Dry-Run Confidence Monitor")
-        print("12. Exit")
+        print("6. Capture & crop hud_in_run.png          (Recommended: red STOP button / wave HUD)")
+        print("7. Capture & crop btn_yes_continue.png    (Recommended mid-run resume button)")
+        print("8. Capture & crop btn_continue.png        (Optional bottom Continue button)")
+        print("9. Capture & crop btn_start_over.png      (Optional Start Over button)")
+        print("10. Capture & crop modal_same_account.png (Optional Error 273 guard text)")
+        print("11. Capture & crop btn_upgrades.png       (Optional Auto-Upgrade lobby button)")
+        print("12. Capture & crop btn_upgrades_close.png (Optional Auto-Upgrade Close button)")
+        print("13. Capture & crop optional dismiss/*.png popup")
+        print("14. Live Dry-Run Confidence Monitor")
+        print("15. Test Auto-Upgrade vision on live tree or PNG")
+        print("16. Exit")
 
-        choice = input("Select option [1-12]: ").strip()
+        choice = input("Select option [1-16]: ").strip()
         if choice == "1":
             snap_roblox(controller)
         elif choice == "2":
@@ -232,7 +333,7 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
             ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
             src = Path(ans.strip('"')) if ans else None
             crop_template_interactive(name, assets_dir / f"{name}.png", controller, vision, src)
-        elif choice == "10":
+        elif choice == "13":
             popup_name = input("Enter filename for dismiss template (e.g., popup_close): ").strip()
             if popup_name:
                 ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
@@ -244,9 +345,13 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
                     vision,
                     src,
                 )
-        elif choice == "11":
+        elif choice == "14":
             run_confidence_monitor(controller, vision)
-        elif choice == "12":
+        elif choice == "15":
+            ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
+            src = Path(ans.strip('"')) if ans else None
+            run_test_upgrades(controller, vision, image_path=src)
+        elif choice == "16":
             return 0
         else:
             print("Invalid choice.")
@@ -267,6 +372,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--dismiss", type=str, help="Capture and crop an optional dismiss template.")
     parser.add_argument("--from-image", type=Path, help="Optional PNG file to crop from instead of live screen.")
+    parser.add_argument(
+        "--test-upgrades",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="IMAGE_PATH",
+        help="Test upgrade tree detection on live Roblox or an optional PNG screenshot.",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=["main_only", "main_then_sides"],
+        default=None,
+        help="Override auto_upgrade.scope for --test-upgrades.",
+    )
+    parser.add_argument(
+        "--resize-1280x720",
+        action="store_true",
+        help="Resize input image to 1280x720 before running --test-upgrades.",
+    )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Save annotated preview without opening a GUI window during --test-upgrades.",
+    )
     args = parser.parse_args(argv)
 
     config = load_config()
@@ -296,6 +425,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.monitor:
         run_confidence_monitor(controller, vision)
         return 0
+    if args.test_upgrades is not None:
+        src_img = Path(args.test_upgrades) if args.test_upgrades else None
+        return run_test_upgrades(
+            controller,
+            vision,
+            image_path=src_img,
+            scope=args.scope,
+            resize_1280x720=args.resize_1280x720,
+            no_gui=args.no_gui,
+        )
 
     return _interactive_menu(controller, vision)
 

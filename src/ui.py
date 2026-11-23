@@ -19,6 +19,7 @@ STATE_COLORS: dict[str, str] = {
     MacroState.IDLE.value: "#6B7280",
     MacroState.LAUNCHING.value: "#2563EB",
     MacroState.READY_TO_START.value: "#D97706",
+    MacroState.UPGRADING.value: "#0891B2",
     MacroState.IN_RUN.value: "#16A34A",
     MacroState.DISCONNECTED.value: "#DC2626",
     MacroState.WATCHDOG_RECOVERY.value: "#9333EA",
@@ -77,6 +78,8 @@ class MacroApp(ctk.CTk):
                 "WARN",
                 f"Missing templates: {', '.join(missing)}. Run calibrate.bat before starting.",
             )
+        if self.config_data.auto_upgrade.enabled:
+            self._warn_if_upgrade_templates_missing()
 
         self.after(100, self._poll_queue)
 
@@ -146,9 +149,10 @@ class MacroApp(ctk.CTk):
         self.state_badge.grid(row=0, column=1, padx=12, pady=(10, 4), sticky="e")
 
         self.runs_label = self._add_stat_row(stats_frame, 1, "Runs Completed", "0")
-        self.disconnects_label = self._add_stat_row(stats_frame, 2, "Disconnects", "0")
-        self.recoveries_label = self._add_stat_row(stats_frame, 3, "Watchdog Recoveries", "0")
-        self.uptime_label = self._add_stat_row(stats_frame, 4, "Uptime", "00:00:00")
+        self.upgrades_label = self._add_stat_row(stats_frame, 2, "Upgrades Bought", "0")
+        self.disconnects_label = self._add_stat_row(stats_frame, 3, "Disconnects", "0")
+        self.recoveries_label = self._add_stat_row(stats_frame, 4, "Watchdog Recoveries", "0")
+        self.uptime_label = self._add_stat_row(stats_frame, 5, "Uptime", "00:00:00")
 
         self.conf_label = ctk.CTkLabel(
             stats_frame,
@@ -156,7 +160,7 @@ class MacroApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color="#9CA3AF",
         )
-        self.conf_label.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="w")
+        self.conf_label.grid(row=6, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="w")
 
         # Controls
         controls = ctk.CTkFrame(self)
@@ -182,12 +186,39 @@ class MacroApp(ctk.CTk):
         )
         self.dry_run_switch.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
 
+        self.auto_upgrade_var = ctk.BooleanVar(value=bool(self.config_data.auto_upgrade.enabled))
+        self.auto_upgrade_switch = ctk.CTkSwitch(
+            controls,
+            text="Auto-Upgrade",
+            variable=self.auto_upgrade_var,
+            command=self._on_auto_upgrade_toggled,
+        )
+        self.auto_upgrade_switch.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+
+        ctk.CTkLabel(
+            controls,
+            text="Upgrade Scope",
+            font=ctk.CTkFont(size=11),
+            text_color="#D1D5DB",
+        ).grid(row=3, column=0, padx=12, pady=(0, 8), sticky="w")
+
+        initial_scope = (
+            "Main → Sides" if self.config_data.auto_upgrade.scope == "main_then_sides" else "Main Only"
+        )
+        self.upgrade_scope_seg = ctk.CTkSegmentedButton(
+            controls,
+            values=["Main Only", "Main → Sides"],
+            command=self._on_upgrade_scope_changed,
+        )
+        self.upgrade_scope_seg.set(initial_scope)
+        self.upgrade_scope_seg.grid(row=3, column=1, padx=(0, 12), pady=(0, 8), sticky="ew")
+
         ctk.CTkLabel(
             controls,
             text="Mid-Run Disconnect",
             font=ctk.CTkFont(size=11),
             text_color="#D1D5DB",
-        ).grid(row=2, column=0, padx=12, pady=(0, 8), sticky="w")
+        ).grid(row=4, column=0, padx=12, pady=(0, 8), sticky="w")
 
         initial_mode = (
             "Start Over" if self.config_data.recovery.resume_mode == "start_over" else "Resume Run"
@@ -198,7 +229,7 @@ class MacroApp(ctk.CTk):
             command=self._on_resume_mode_changed,
         )
         self.resume_mode_seg.set(initial_mode)
-        self.resume_mode_seg.grid(row=2, column=1, padx=(0, 12), pady=(0, 8), sticky="ew")
+        self.resume_mode_seg.grid(row=4, column=1, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.snap_btn = ctk.CTkButton(
             controls,
@@ -208,7 +239,7 @@ class MacroApp(ctk.CTk):
             hover_color="#4B5563",
             command=self._on_snap_roblox,
         )
-        self.snap_btn.grid(row=3, column=0, padx=(12, 6), pady=(0, 12), sticky="ew")
+        self.snap_btn.grid(row=5, column=0, padx=(12, 6), pady=(0, 12), sticky="ew")
 
         self.logs_btn = ctk.CTkButton(
             controls,
@@ -218,7 +249,7 @@ class MacroApp(ctk.CTk):
             hover_color="#4B5563",
             command=self._on_open_logs,
         )
-        self.logs_btn.grid(row=3, column=1, padx=(6, 12), pady=(0, 12), sticky="ew")
+        self.logs_btn.grid(row=5, column=1, padx=(6, 12), pady=(0, 12), sticky="ew")
 
         # Activity Log
         log_frame = ctk.CTkFrame(self)
@@ -248,6 +279,39 @@ class MacroApp(ctk.CTk):
         val_label = ctk.CTkLabel(parent, text=initial, font=ctk.CTkFont(size=12, weight="bold"))
         val_label.grid(row=row, column=1, padx=12, pady=2, sticky="e")
         return val_label
+
+    def _warn_if_upgrade_templates_missing(self) -> None:
+        missing = [
+            name
+            for name in ("btn_upgrades", "btn_upgrades_close")
+            if not self.fsm.vision.has_template(name)
+        ]
+        if missing:
+            self.append_log(
+                "WARN",
+                f"Auto-Upgrade enabled, but missing template(s): {', '.join(missing)}. Run calibrate.bat to capture them.",
+            )
+
+    def _on_auto_upgrade_toggled(self) -> None:
+        enabled = bool(self.auto_upgrade_var.get())
+        self.config_data.auto_upgrade.enabled = enabled
+        try:
+            save_config(self.config_data)
+        except OSError as exc:
+            self.append_log("WARN", f"Could not save auto_upgrade.enabled to config.json: {exc}")
+        self.append_log("INFO", f"Auto-Upgrade {'enabled' if enabled else 'disabled'}.")
+        if enabled:
+            self.fsm.vision.reload_templates()
+            self._warn_if_upgrade_templates_missing()
+
+    def _on_upgrade_scope_changed(self, value: str) -> None:
+        scope = "main_then_sides" if value == "Main → Sides" else "main_only"
+        self.config_data.auto_upgrade.scope = scope
+        try:
+            save_config(self.config_data)
+        except OSError as exc:
+            self.append_log("WARN", f"Could not save auto_upgrade.scope to config.json: {exc}")
+        self.append_log("INFO", f"Auto-Upgrade scope set to '{scope}'.")
 
     def _on_resume_mode_changed(self, value: str) -> None:
         mode = "start_over" if value == "Start Over" else "continue"
@@ -313,6 +377,7 @@ class MacroApp(ctk.CTk):
         badge_text = f"{state_name} (DRY)" if self.fsm.dry_run and state_name != MacroState.IDLE.value else state_name
         self.state_badge.configure(text=badge_text, fg_color=color)
         self.runs_label.configure(text=str(stats.runs_completed))
+        self.upgrades_label.configure(text=str(stats.upgrades_purchased))
         self.disconnects_label.configure(text=str(stats.disconnects))
         self.recoveries_label.configure(text=str(stats.watchdog_recoveries))
 
