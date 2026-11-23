@@ -18,6 +18,7 @@ from src.win32_utils import (
     focus_window,
     get_client_rect_screen,
     is_process_running,
+    is_window_focused,
     move_mouse_abs,
     move_mouse_relative,
     scroll_mouse_wheel,
@@ -68,6 +69,11 @@ class RobloxController:
             size_mode=w.size_mode,
         )
 
+    def is_focused(self, hwnd: Optional[int] = None) -> bool:
+        """Return True if the Roblox window is the current foreground window."""
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        return bool(target) and is_window_focused(target)
+
     def focus(self, hwnd: Optional[int] = None) -> bool:
         """Bring the Roblox window to the foreground."""
         target = hwnd if hwnd is not None else self.get_hwnd()
@@ -112,12 +118,44 @@ class RobloxController:
             psutil.wait_procs(alive, timeout=2.0)
         return len(procs)
 
+    def hover_client_point(
+        self,
+        client_x: int,
+        client_y: int,
+        hwnd: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> bool:
+        """Focus Roblox and move cursor over client coordinates with a 1px nudge to trigger tooltips."""
+        if dry_run:
+            return True
+
+        target = hwnd if hwnd is not None else self.get_hwnd()
+        if target is None or not self.focus(target):
+            return False
+
+        rect = self.get_client_rect(target)
+        if rect is None:
+            return False
+
+        left, top, width, height = rect
+        if client_x < 0 or client_y < 0 or client_x >= width or client_y >= height:
+            return False
+
+        sx = left + int(client_x)
+        sy = top + int(client_y)
+        nudge_x = sx + (1 if int(client_x) + 1 < width else -1)
+        move_mouse_abs(nudge_x, sy)
+        time.sleep(0.015)
+        move_mouse_abs(sx, sy)
+        return True
+
     def click_client_point(
         self,
         client_x: int,
         client_y: int,
         hwnd: Optional[int] = None,
         dry_run: bool = False,
+        park_cursor: bool = True,
     ) -> bool:
         """Focus Roblox, convert client coords to screen coords, and click with hover nudge."""
         if dry_run:
@@ -136,8 +174,9 @@ class RobloxController:
             return False
 
         click_screen_point(left + int(client_x), top + int(client_y), hover_nudge_px=2)
-        # Park cursor in a neutral area so hover effects don't linger on buttons
-        move_mouse_abs(left + 20, top + max(20, int(height * 0.5)))
+        if park_cursor:
+            # Park cursor in a neutral area so hover effects don't linger on buttons
+            move_mouse_abs(left + 20, top + max(20, int(height * 0.5)))
         return True
 
     def scroll_client_point(

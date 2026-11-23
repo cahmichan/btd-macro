@@ -38,6 +38,8 @@ def test_default_config_values() -> None:
     assert cfg.thresholds.hud_in_run == 0.85
     assert cfg.thresholds.btn_upgrades == 0.85
     assert cfg.thresholds.btn_upgrades_close == 0.85
+    assert cfg.thresholds.btn_spawners == 0.85
+    assert cfg.thresholds.btn_spawners_close == 0.85
     assert cfg.rois.btn_battle == [0.42, 0.75, 0.70, 1.0]
     assert cfg.rois.modal_same_account == [0.15, 0.15, 0.85, 0.85]
     assert cfg.rois.btn_yes_continue == [0.30, 0.42, 0.72, 0.72]
@@ -45,6 +47,9 @@ def test_default_config_values() -> None:
     assert cfg.rois.hud_in_run == [0.22, 0.74, 0.78, 1.0]
     assert cfg.rois.btn_upgrades == [0.0, 0.0, 1.0, 1.0]
     assert cfg.rois.btn_upgrades_close == [0.38, 0.85, 0.62, 1.0]
+    assert cfg.rois.btn_spawners == [0.0, 0.0, 1.0, 1.0]
+    assert cfg.rois.btn_spawners_close == [0.66, 0.05, 0.76, 0.18]
+    assert cfg.timeouts.purchasing_spawners_sec == 120.0
     assert cfg.timeouts.upgrading_sec == 60.0
     assert cfg.anti_afk.interval_sec == 720.0
     assert cfg.recovery.max_reconnect_retries == 2
@@ -52,6 +57,17 @@ def test_default_config_values() -> None:
     assert cfg.recovery.circuit_breaker_window_sec == 900.0
     assert cfg.recovery.resume_mode == "continue"
     assert cfg.recovery.stop_on_same_account is True
+    assert cfg.auto_spawner.enabled is False
+    assert cfg.auto_spawner.every_n_runs == 1
+    assert cfg.auto_spawner.run_on_start is True
+    assert cfg.auto_spawner.max_purchases_per_pass == 80
+    assert cfg.auto_spawner.pass_timeout_sec == 90.0
+    assert cfg.auto_spawner.clicks_per_pill == 5
+    assert cfg.auto_spawner.click_hover_sec == 0.12
+    assert cfg.auto_spawner.click_interval_sec == 0.35
+    assert cfg.auto_spawner.round_settle_sec == 1.0
+    assert cfg.auto_spawner.scroll_notches_per_step == 5
+    assert cfg.auto_spawner.max_scroll_steps == 15
     assert cfg.auto_upgrade.enabled is False
     assert cfg.auto_upgrade.every_n_runs == 1
     assert cfg.auto_upgrade.run_on_start is True
@@ -65,6 +81,13 @@ def test_default_config_values() -> None:
     assert cfg.auto_upgrade.pass_timeout_sec == 45.0
     assert cfg.auto_upgrade.post_click_settle_sec == 0.35
     assert cfg.auto_upgrade.tile_click_y_offset_px == -14
+    assert cfg.auto_upgrade.blocked_keywords == ["board"]
+    assert cfg.auto_upgrade.fail_closed_tooltip_check is True
+    assert cfg.auto_upgrade.hover_settle_sec == 0.14
+    assert cfg.auto_upgrade.adaptive_zoom is True
+    assert cfg.auto_upgrade.min_start_tile_height_px == 30
+    assert cfg.auto_upgrade.max_start_tile_height_px == 44
+    assert cfg.auto_upgrade.center_tolerance_px == 60
     assert cfg.logging.max_failure_snapshots == 20
     assert cfg.hotkey == "F8"
 
@@ -108,7 +131,12 @@ def test_partial_config_merges_onto_defaults(tmp_path: Path) -> None:
                 "window": {"x": 10},
                 "thresholds": {"btn_battle": 0.78},
                 "recovery": {"stop_on_same_account": False},
-                "auto_upgrade": {"enabled": True, "scope": "main_then_sides"},
+                "auto_spawner": {"enabled": True, "every_n_runs": 2},
+                "auto_upgrade": {
+                    "enabled": True,
+                    "scope": "main_then_sides",
+                    "blocked_keywords": ["board", "head start"],
+                },
             }
         ),
         encoding="utf-8",
@@ -123,8 +151,12 @@ def test_partial_config_merges_onto_defaults(tmp_path: Path) -> None:
     assert loaded.thresholds.modal_same_account == 0.85
     assert loaded.recovery.circuit_breaker_max_triggers == 5
     assert loaded.recovery.stop_on_same_account is False
+    assert loaded.auto_spawner.enabled is True
+    assert loaded.auto_spawner.every_n_runs == 2
+    assert loaded.auto_spawner.clicks_per_pill == 5
     assert loaded.auto_upgrade.enabled is True
     assert loaded.auto_upgrade.scope == "main_then_sides"
+    assert loaded.auto_upgrade.blocked_keywords == ["board", "head start"]
     assert loaded.auto_upgrade.max_purchases_per_pass == 25
     assert loaded.auto_upgrade.tile_click_y_offset_px == -14
 

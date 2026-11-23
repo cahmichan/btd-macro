@@ -33,6 +33,8 @@ OPTIONAL_TEMPLATES: tuple[str, ...] = (
     "modal_same_account",
     "btn_upgrades",
     "btn_upgrades_close",
+    "btn_spawners",
+    "btn_spawners_close",
 )
 
 

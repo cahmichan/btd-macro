@@ -19,6 +19,7 @@ STATE_COLORS: dict[str, str] = {
     MacroState.IDLE.value: "#6B7280",
     MacroState.LAUNCHING.value: "#2563EB",
     MacroState.READY_TO_START.value: "#D97706",
+    MacroState.PURCHASING_SPAWNERS.value: "#0D9488",
     MacroState.UPGRADING.value: "#0891B2",
     MacroState.IN_RUN.value: "#16A34A",
     MacroState.DISCONNECTED.value: "#DC2626",
@@ -78,6 +79,8 @@ class MacroApp(ctk.CTk):
                 "WARN",
                 f"Missing templates: {', '.join(missing)}. Run calibrate.bat before starting.",
             )
+        if self.config_data.auto_spawner.enabled:
+            self._warn_if_spawner_templates_missing()
         if self.config_data.auto_upgrade.enabled:
             self._warn_if_upgrade_templates_missing()
 
@@ -149,10 +152,11 @@ class MacroApp(ctk.CTk):
         self.state_badge.grid(row=0, column=1, padx=12, pady=(10, 4), sticky="e")
 
         self.runs_label = self._add_stat_row(stats_frame, 1, "Runs Completed", "0")
-        self.upgrades_label = self._add_stat_row(stats_frame, 2, "Upgrades Bought", "0")
-        self.disconnects_label = self._add_stat_row(stats_frame, 3, "Disconnects", "0")
-        self.recoveries_label = self._add_stat_row(stats_frame, 4, "Watchdog Recoveries", "0")
-        self.uptime_label = self._add_stat_row(stats_frame, 5, "Uptime", "00:00:00")
+        self.spawners_label = self._add_stat_row(stats_frame, 2, "Spawner Buy Clicks", "0")
+        self.upgrades_label = self._add_stat_row(stats_frame, 3, "Upgrades Bought", "0")
+        self.disconnects_label = self._add_stat_row(stats_frame, 4, "Disconnects", "0")
+        self.recoveries_label = self._add_stat_row(stats_frame, 5, "Watchdog Recoveries", "0")
+        self.uptime_label = self._add_stat_row(stats_frame, 6, "Uptime", "00:00:00")
 
         self.conf_label = ctk.CTkLabel(
             stats_frame,
@@ -160,7 +164,7 @@ class MacroApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color="#9CA3AF",
         )
-        self.conf_label.grid(row=6, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="w")
+        self.conf_label.grid(row=7, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="w")
 
         # Controls
         controls = ctk.CTkFrame(self)
@@ -186,6 +190,15 @@ class MacroApp(ctk.CTk):
         )
         self.dry_run_switch.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
 
+        self.auto_spawner_var = ctk.BooleanVar(value=bool(self.config_data.auto_spawner.enabled))
+        self.auto_spawner_switch = ctk.CTkSwitch(
+            controls,
+            text="Auto-Spawners",
+            variable=self.auto_spawner_var,
+            command=self._on_auto_spawner_toggled,
+        )
+        self.auto_spawner_switch.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="w")
+
         self.auto_upgrade_var = ctk.BooleanVar(value=bool(self.config_data.auto_upgrade.enabled))
         self.auto_upgrade_switch = ctk.CTkSwitch(
             controls,
@@ -193,7 +206,7 @@ class MacroApp(ctk.CTk):
             variable=self.auto_upgrade_var,
             command=self._on_auto_upgrade_toggled,
         )
-        self.auto_upgrade_switch.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="w")
+        self.auto_upgrade_switch.grid(row=2, column=1, padx=(0, 12), pady=(0, 8), sticky="w")
 
         ctk.CTkLabel(
             controls,
@@ -279,6 +292,30 @@ class MacroApp(ctk.CTk):
         val_label = ctk.CTkLabel(parent, text=initial, font=ctk.CTkFont(size=12, weight="bold"))
         val_label.grid(row=row, column=1, padx=12, pady=2, sticky="e")
         return val_label
+
+    def _warn_if_spawner_templates_missing(self) -> None:
+        missing = [
+            name
+            for name in ("btn_spawners", "btn_spawners_close")
+            if not self.fsm.vision.has_template(name)
+        ]
+        if missing:
+            self.append_log(
+                "WARN",
+                f"Auto-Spawners enabled, but missing template(s): {', '.join(missing)}. Run calibrate.bat to capture them.",
+            )
+
+    def _on_auto_spawner_toggled(self) -> None:
+        enabled = bool(self.auto_spawner_var.get())
+        self.config_data.auto_spawner.enabled = enabled
+        try:
+            save_config(self.config_data)
+        except OSError as exc:
+            self.append_log("WARN", f"Could not save auto_spawner.enabled to config.json: {exc}")
+        self.append_log("INFO", f"Auto-Spawners {'enabled' if enabled else 'disabled'}.")
+        if enabled:
+            self.fsm.vision.reload_templates()
+            self._warn_if_spawner_templates_missing()
 
     def _warn_if_upgrade_templates_missing(self) -> None:
         missing = [
@@ -377,6 +414,7 @@ class MacroApp(ctk.CTk):
         badge_text = f"{state_name} (DRY)" if self.fsm.dry_run and state_name != MacroState.IDLE.value else state_name
         self.state_badge.configure(text=badge_text, fg_color=color)
         self.runs_label.configure(text=str(stats.runs_completed))
+        self.spawners_label.configure(text=str(stats.spawners_purchased))
         self.upgrades_label.configure(text=str(stats.upgrades_purchased))
         self.disconnects_label.configure(text=str(stats.disconnects))
         self.recoveries_label.configure(text=str(stats.watchdog_recoveries))
@@ -449,6 +487,8 @@ class MacroApp(ctk.CTk):
             if self.fsm.is_running:
                 self.fsm.stop("Application closing")
         finally:
+            if hasattr(self.fsm, "close"):
+                self.fsm.close()
             if self.hotkey_listener is not None:
                 self.hotkey_listener.stop()
             allow_sleep()

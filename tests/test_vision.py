@@ -77,6 +77,8 @@ def test_dismiss_templates_and_missing_required(tmp_path: Path) -> None:
     cv2.imwrite(str(assets_dir / "modal_same_account.png"), _make_textured_button((140, 140, 140)))
     cv2.imwrite(str(assets_dir / "btn_upgrades.png"), _make_textured_button((40, 160, 220)))
     cv2.imwrite(str(assets_dir / "btn_upgrades_close.png"), _make_textured_button((60, 60, 210)))
+    cv2.imwrite(str(assets_dir / "btn_spawners.png"), _make_textured_button((40, 130, 200)))
+    cv2.imwrite(str(assets_dir / "btn_spawners_close.png"), _make_textured_button((50, 50, 220)))
     popup_close = _make_textured_button((60, 60, 60), w=50, h=30)
     cv2.imwrite(str(dismiss_dir / "close_x.png"), popup_close)
 
@@ -89,6 +91,8 @@ def test_dismiss_templates_and_missing_required(tmp_path: Path) -> None:
     assert engine.has_template("modal_same_account") is True
     assert engine.has_template("btn_upgrades") is True
     assert engine.has_template("btn_upgrades_close") is True
+    assert engine.has_template("btn_spawners") is True
+    assert engine.has_template("btn_spawners_close") is True
 
     frame = np.full((240, 320, 3), 15, dtype=np.uint8)
     frame[50:80, 120:170] = popup_close

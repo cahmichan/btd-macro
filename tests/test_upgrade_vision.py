@@ -9,8 +9,14 @@ import numpy as np
 import pytest
 
 from src.upgrade_vision import (
+    StartAnchor,
     UpgradeCandidate,
+    build_hud_mask,
+    classify_upgrade_tooltip,
     detect_affordable_upgrades,
+    extract_hover_tooltip_crop,
+    find_empty_drag_origin,
+    find_start_anchor,
     is_same_candidate,
 )
 
@@ -18,6 +24,7 @@ from src.upgrade_vision import (
 SCREENSHOT_DIR = Path(__file__).resolve().parent.parent.parent
 SHOT_MID_ZOOM = SCREENSHOT_DIR / "RobloxScreenShot20261123_094905285.png"
 SHOT_ZOOMED_IN = SCREENSHOT_DIR / "RobloxScreenShot20261123_094851156.png"
+SHOT_ZOOMED_OUT = SCREENSHOT_DIR / "RobloxScreenShot20261123_094856406.png"
 
 CREAM_YELLOW_BGR = (127, 220, 249)  # RGB(249, 220, 127)
 CORAL_RED_BGR = (101, 117, 226)     # RGB(226, 117, 101)
@@ -192,3 +199,75 @@ def test_real_zoomed_in_screenshot_clips_all_edges_at_1280x720() -> None:
     res = detect_affordable_upgrades(img720, scope="main_only")
     assert len(res.candidates) == 4
     assert res.clipped_edges == {"top", "bottom", "left", "right"}
+    assert res.start_anchor is not None
+    assert res.start_anchor.height_px >= 85
+
+
+@pytest.mark.skipif(
+    not (SHOT_MID_ZOOM.is_file() and SHOT_ZOOMED_IN.is_file() and SHOT_ZOOMED_OUT.is_file()),
+    reason="Upgrade tree screenshot fixtures not present",
+)
+def test_start_anchor_detected_across_all_three_zoom_levels() -> None:
+    for shot_path, expected_range in (
+        (SHOT_ZOOMED_OUT, (16, 26)),
+        (SHOT_MID_ZOOM, (30, 44)),
+        (SHOT_ZOOMED_IN, (80, 110)),
+    ):
+        raw = cv2.imread(str(shot_path))
+        assert raw is not None
+        img = cv2.resize(raw, (1264, 681), interpolation=cv2.INTER_AREA)
+        anchor = find_start_anchor(img)
+        assert anchor is not None, f"Start anchor missing on {shot_path.name}"
+        assert expected_range[0] <= anchor.height_px <= expected_range[1]
+        assert abs(anchor.center[0] - 631) <= 15
+        assert abs(anchor.center[1] - 340) <= 15
+
+
+def test_blank_void_noise_rejected_and_empty_drag_origin_avoids_tree_and_hud() -> None:
+    # Faint low-contrast blurred background blobs without Start anchor must NOT be labeled main tree
+    noisy_bg = np.full((720, 1280, 3), 24, dtype=np.uint8)
+    cv2.circle(noisy_bg, (640, 360), 35, (65, 78, 82), -1)  # dim, low-saturation blurred blob
+    scan = detect_affordable_upgrades(noisy_bg)
+    assert scan.start_anchor is None
+    assert scan.main_tree_bbox is None
+    assert scan.tree_coverage_ratio == 0.0
+
+    # Safe empty drag origin must start outside main_tree_bbox + HUD mask
+    hud = build_hud_mask(720, 1280)
+    main_bbox = (330, 50, 620, 590)
+    pair = find_empty_drag_origin(noisy_bg.shape, main_bbox, hud, 0, 140)
+    assert pair is not None
+    (sx, sy), (ex, ey) = pair
+    assert hud[sy, sx] > 0
+    assert hud[ey, ex] > 0
+    # Outside padded main_tree_bbox
+    assert sx < 330 - 16 or sx > 330 + 620 + 16
+
+
+def test_tooltip_crop_extraction_and_board_denylist_fail_closed() -> None:
+    before = np.full((720, 1280, 3), 24, dtype=np.uint8)
+    _draw_synthetic_tile(before, 520, 340, "affordable", "$250.0M")
+    after = before.copy()
+    # Simulate dark slate tooltip card appearing next to hovered tile
+    cv2.rectangle(after, (560, 315), (770, 395), (40, 32, 25), -1)
+    cv2.putText(after, "Board V", (575, 342), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    cv2.putText(after, "+1 Board Size", (575, 368), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    # Also simulate unrelated HUD cash text change in masked bottom-left corner
+    cv2.rectangle(after, (20, 520), (180, 560), (20, 200, 20), -1)
+
+    crop = extract_hover_tooltip_crop(before, after, (520, 340))
+    assert crop is not None
+    assert 190 <= crop.shape[1] <= 230
+    assert 65 <= crop.shape[0] <= 95
+
+    assert classify_upgrade_tooltip(["Board V", "+1 Board Size"]).status == "blocked"
+    assert classify_upgrade_tooltip(["Board VI", "17 x 17"]).status == "blocked"
+    assert classify_upgrade_tooltip(["Boar0 V", "+1 Board"]).status == "blocked"
+    assert classify_upgrade_tooltip(["16 x 16 grid"]).status == "blocked"
+    assert classify_upgrade_tooltip(["Luck VI", "+5% Luck", "Unlocked"]).status == "unlocked"
+    assert classify_upgrade_tooltip([]).status == "unreadable"
+    assert classify_upgrade_tooltip(["   "]).status == "unreadable"
+
+    safe = classify_upgrade_tooltip(["Damage XII", "+25% Tower Damage", "$125.0M"])
+    assert safe.status == "safe"
+    assert safe.title == "Damage XII"

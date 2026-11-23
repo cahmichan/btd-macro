@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import cv2
 import numpy as np
+
+
+@dataclass(frozen=True)
+class StartAnchor:
+    """Visual anchor for the unique cyan/lime-arrow Start hex tile."""
+
+    center: tuple[int, int]
+    bbox: tuple[int, int, int, int]  # (x, y, width, height)
+    height_px: int
+
+
+@dataclass(frozen=True)
+class TooltipClassification:
+    """Safety verdict from OCR lines of a hovered upgrade tooltip card."""
+
+    status: str  # "safe" | "blocked" | "unlocked" | "unreadable"
+    title: str
+    lines: tuple[str, ...]
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -30,6 +50,15 @@ class TreeScanResult:
     all_candidates: list[UpgradeCandidate]
     main_tree_bbox: Optional[tuple[int, int, int, int]]
     clipped_edges: set[str]
+    start_anchor: Optional[StartAnchor] = None
+    tree_coverage_ratio: float = 0.0
+
+
+_BOARD_FUZZY_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bboar[d0]\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*x\s*\d+\b", re.IGNORECASE),
+)
+_UNLOCKED_REGEX = re.compile(r"\bunlocked\b", re.IGNORECASE)
 
 
 def build_hud_mask(height: int, width: int) -> np.ndarray:
@@ -49,9 +78,66 @@ def build_hud_mask(height: int, width: int) -> np.ndarray:
     return mask
 
 
+def find_start_anchor(
+    frame: Optional[np.ndarray],
+    *,
+    hsv: Optional[np.ndarray] = None,
+    hud_mask: Optional[np.ndarray] = None,
+) -> Optional[StartAnchor]:
+    """Detect the unique cyan Start hex containing the bright lime-green upward arrow."""
+    if frame is None or frame.size == 0 or frame.ndim != 3:
+        return None
+
+    h, w = frame.shape[:2]
+    scale = min(w / 1280.0, h / 720.0)
+    mask = hud_mask if hud_mask is not None else build_hud_mask(h, w)
+    hsv_img = hsv if hsv is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    h_ch, s_ch, v_ch = hsv_img[:, :, 0], hsv_img[:, :, 1], hsv_img[:, :, 2]
+    cyan_mask = ((h_ch >= 85) & (h_ch <= 102) & (s_ch >= 140) & (v_ch >= 140)).astype(np.uint8) * 255
+    lime_mask = ((h_ch >= 42) & (h_ch <= 72) & (s_ch >= 130) & (v_ch >= 150)).astype(np.uint8) * 255
+
+    cyan_mask = cv2.bitwise_and(cyan_mask, mask)
+    lime_mask = cv2.bitwise_and(lime_mask, mask)
+
+    k_sz = max(3, int(round(5 * scale)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+    cyan_closed = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(cyan_closed, connectivity=8)
+
+    min_w = max(8, int(round(10 * scale)))
+    min_h = max(10, int(round(12 * scale)))
+
+    best_score = -1
+    best_anchor: Optional[StartAnchor] = None
+    for cid in range(1, num_labels):
+        bx, by, bw, bh, _ = [int(v) for v in stats[cid]]
+        if bw < min_w or bh < min_h:
+            continue
+        aspect = bw / max(1, bh)
+        if not (0.55 <= aspect <= 1.35):
+            continue
+
+        lime_inside = int(np.count_nonzero(lime_mask[by : by + bh, bx : bx + bw]))
+        if lime_inside < max(4, int(0.03 * bw * bh)):
+            continue
+
+        if lime_inside > best_score:
+            best_score = lime_inside
+            cx = max(0, min(w - 1, int(round(float(centroids[cid][0])))))
+            cy = max(0, min(h - 1, int(round(float(centroids[cid][1])))))
+            best_anchor = StartAnchor(center=(cx, cy), bbox=(bx, by, bw, bh), height_px=bh)
+
+    return best_anchor
+
+
 def segment_tree_clusters(
     frame: Optional[np.ndarray],
     hud_mask: Optional[np.ndarray] = None,
+    *,
+    hsv: Optional[np.ndarray] = None,
+    start_anchor: Optional[StartAnchor] = None,
 ) -> tuple[np.ndarray, int, tuple[float, float], Optional[tuple[int, int, int, int]], set[str]]:
     """Segment hex tile clusters and identify the main middle tree and clipped viewport edges."""
     if frame is None or frame.size == 0 or frame.ndim != 3:
@@ -60,11 +146,11 @@ def segment_tree_clusters(
     h, w = frame.shape[:2]
     scale = min(w / 1280.0, h / 720.0)
     mask = hud_mask if hud_mask is not None else build_hud_mask(h, w)
+    hsv_img = hsv if hsv is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     # Hex tiles stand out from the dark blurred game background by brightness or color saturation
     tile_mask = (
-        (hsv[:, :, 2] >= 75) & ((hsv[:, :, 1] >= 45) | (hsv[:, :, 2] >= 120))
+        (hsv_img[:, :, 2] >= 75) & ((hsv_img[:, :, 1] >= 45) | (hsv_img[:, :, 2] >= 120))
     ).astype(np.uint8) * 255
     tile_mask = cv2.bitwise_and(tile_mask, mask)
 
@@ -79,20 +165,47 @@ def segment_tree_clusters(
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed, connectivity=8)
 
     fcx, fcy = w / 2.0, h / 2.0
-    min_area = max(100, int(round(300 * scale * scale)))
-    main_id = 0
-    best_score = -1.0
+    min_area_with_start = max(100, int(round(300 * scale * scale)))
+    min_area_no_start = max(1200, int(round(2200 * scale * scale)))
+    vivid_mask = (hsv_img[:, :, 1] >= 65) | (hsv_img[:, :, 2] >= 140)
 
-    for cid in range(1, num_labels):
-        area = int(stats[cid, cv2.CC_STAT_AREA])
-        if area < min_area:
-            continue
-        cx, cy = float(centroids[cid][0]), float(centroids[cid][1])
-        dist = math.hypot(cx - fcx, cy - fcy)
-        score = area / (1.0 + dist / max(w, h))
-        if score > best_score:
-            best_score = score
-            main_id = cid
+    main_id = 0
+    if start_anchor is not None:
+        ax, ay = start_anchor.center
+        if 0 <= ax < w and 0 <= ay < h:
+            cand_id = int(labels[ay, ax])
+            if cand_id > 0 and int(stats[cand_id, cv2.CC_STAT_AREA]) >= min_area_with_start:
+                main_id = cand_id
+            else:
+                # Check the Start bounding box in case its center pixel is slightly off a label mask
+                bx, by, bw, bh = start_anchor.bbox
+                patch = labels[max(0, by) : min(h, by + bh), max(0, bx) : min(w, bx + bw)]
+                nz = patch[patch > 0]
+                if nz.size > 0:
+                    vals, counts = np.unique(nz, return_counts=True)
+                    top_id = int(vals[int(np.argmax(counts))])
+                    if int(stats[top_id, cv2.CC_STAT_AREA]) >= min_area_with_start:
+                        main_id = top_id
+
+    if main_id == 0:
+        best_score = -1.0
+        min_area = min_area_with_start if start_anchor is not None else min_area_no_start
+        for cid in range(1, num_labels):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            if start_anchor is None:
+                bx, by, bw, bh, _ = [int(v) for v in stats[cid]]
+                comp_mask = labels[by : by + bh, bx : bx + bw] == cid
+                vivid_ratio = float(np.mean(vivid_mask[by : by + bh, bx : bx + bw][comp_mask]))
+                if vivid_ratio < 0.12:
+                    continue
+            cx, cy = float(centroids[cid][0]), float(centroids[cid][1])
+            dist = math.hypot(cx - fcx, cy - fcy)
+            score = area / (1.0 + dist / max(w, h))
+            if score > best_score:
+                best_score = score
+                main_id = cid
 
     if main_id == 0:
         return (labels, 0, (fcx, fcy), None, set())
@@ -121,16 +234,37 @@ def detect_affordable_upgrades(
     order: str = "center_first",
     tile_click_y_offset_px: int = -14,
 ) -> TreeScanResult:
-    """Detect affordable hex tiles via cream-yellow price labels and tree clustering."""
+    """Detect affordable hex tiles via cream-yellow price labels, Start anchor, and clustering."""
     if frame is None or frame.size == 0 or frame.ndim != 3:
-        return TreeScanResult(candidates=[], all_candidates=[], main_tree_bbox=None, clipped_edges=set())
+        return TreeScanResult(
+            candidates=[],
+            all_candidates=[],
+            main_tree_bbox=None,
+            clipped_edges=set(),
+            start_anchor=None,
+            tree_coverage_ratio=0.0,
+        )
 
     h, w = frame.shape[:2]
     scale = min(w / 1280.0, h / 720.0)
     hud_mask = build_hud_mask(h, w)
-    labels, main_id, main_centroid, main_bbox, clipped_edges = segment_tree_clusters(frame, hud_mask=hud_mask)
-
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    start_anchor = find_start_anchor(frame, hsv=hsv, hud_mask=hud_mask)
+    labels, main_id, main_centroid, main_bbox, clipped_edges = segment_tree_clusters(
+        frame,
+        hud_mask=hud_mask,
+        hsv=hsv,
+        start_anchor=start_anchor,
+    )
+
+    if main_id > 0:
+        active_px = max(1, int(np.count_nonzero(hud_mask)))
+        main_px = int(np.count_nonzero(labels == main_id))
+        tree_coverage_ratio = float(main_px / active_px)
+    else:
+        tree_coverage_ratio = 0.0
+
     b = frame[:, :, 0].astype(np.int16)
     g = frame[:, :, 1].astype(np.int16)
     r = frame[:, :, 2].astype(np.int16)
@@ -264,6 +398,209 @@ def detect_affordable_upgrades(
         all_candidates=all_candidates,
         main_tree_bbox=main_bbox,
         clipped_edges=clipped_edges,
+        start_anchor=start_anchor,
+        tree_coverage_ratio=tree_coverage_ratio,
+    )
+
+
+def find_empty_drag_origin(
+    frame_shape: tuple[int, ...],
+    main_tree_bbox: Optional[tuple[int, int, int, int]],
+    hud_mask: Optional[np.ndarray],
+    drag_dx: int,
+    drag_dy: int,
+) -> Optional[tuple[tuple[int, int], tuple[int, int]]]:
+    """Find a drag segment ((x1, y1), (x2, y2)) starting in safe empty dark background."""
+    if len(frame_shape) < 2:
+        return None
+    h, w = int(frame_shape[0]), int(frame_shape[1])
+    if h <= 32 or w <= 32:
+        return None
+
+    scale = min(w / 1280.0, h / 720.0)
+    mask = hud_mask.copy() if hud_mask is not None else build_hud_mask(h, w)
+
+    border = max(12, int(round(16 * scale)))
+    if h > 2 * border and w > 2 * border:
+        mask[:border, :] = 0
+        mask[h - border :, :] = 0
+        mask[:, :border] = 0
+        mask[:, w - border :] = 0
+
+    end_valid = (mask > 0).copy()
+
+    if main_tree_bbox is not None:
+        mx, my, mw, mh = main_tree_bbox
+        pad = max(16, int(round(20 * scale)))
+        x1 = max(0, mx - pad)
+        y1 = max(0, my - pad)
+        x2 = min(w, mx + mw + pad)
+        y2 = min(h, my + mh + pad)
+        mask[y1:y2, x1:x2] = 0
+
+    if not np.any(mask > 0):
+        return None
+
+    dist_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+    dx = int(drag_dx)
+    dy = int(drag_dy)
+
+    # Shift end_valid back by (-dx, -dy) to constrain valid start pixels (sx, sy)
+    shifted_end = np.zeros((h, w), dtype=bool)
+    src_y1 = max(0, dy)
+    src_y2 = min(h, h + dy)
+    src_x1 = max(0, dx)
+    src_x2 = min(w, w + dx)
+    dst_y1 = max(0, -dy)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+    dst_x1 = max(0, -dx)
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+
+    if src_y2 <= src_y1 or src_x2 <= src_x1:
+        return None
+    shifted_end[dst_y1:dst_y2, dst_x1:dst_x2] = end_valid[src_y1:src_y2, src_x1:src_x2]
+
+    candidate_scores = np.where((mask > 0) & shifted_end, dist_map, 0.0)
+    best_val = float(candidate_scores.max())
+    if best_val <= 0.0:
+        return None
+
+    by, bx = np.unravel_index(int(np.argmax(candidate_scores)), candidate_scores.shape)
+    sx, sy = int(bx), int(by)
+    ex, ey = sx + dx, sy + dy
+    return ((sx, sy), (ex, ey))
+
+
+def extract_hover_tooltip_crop(
+    before_frame: Optional[np.ndarray],
+    after_frame: Optional[np.ndarray],
+    hover_point: tuple[int, int],
+) -> Optional[np.ndarray]:
+    """Isolate the newly appeared dark hover tooltip card via frame diff near hover_point."""
+    if (
+        before_frame is None
+        or after_frame is None
+        or before_frame.size == 0
+        or after_frame.size == 0
+        or before_frame.shape != after_frame.shape
+        or after_frame.ndim != 3
+    ):
+        return None
+
+    h, w = after_frame.shape[:2]
+    scale = min(w / 1280.0, h / 720.0)
+    hud_mask = build_hud_mask(h, w)
+
+    diff = cv2.absdiff(before_frame, after_frame)
+    diff_max = np.max(diff, axis=2)
+    changed = ((diff_max >= 14).astype(np.uint8) * 255)
+    changed = cv2.bitwise_and(changed, hud_mask)
+
+    k_close_sz = max(7, int(round(11 * scale)) | 1)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close_sz, k_close_sz))
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(changed, cv2.MORPH_CLOSE, k_close)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k_open)
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    hx, hy = int(hover_point[0]), int(hover_point[1])
+
+    min_w = max(50, int(round(65 * scale)))
+    max_w = max(200, int(round(450 * scale)))
+    min_h = max(18, int(round(24 * scale)))
+    max_h = max(100, int(round(240 * scale)))
+    max_dist = max(180.0, 320.0 * scale)
+
+    hsv_after = cv2.cvtColor(after_frame, cv2.COLOR_BGR2HSV)
+    best_dist = float("inf")
+    best_bbox: Optional[tuple[int, int, int, int]] = None
+
+    for cid in range(1, num_labels):
+        bx, by, bw, bh, area = [int(v) for v in stats[cid]]
+        if not (min_w <= bw <= max_w and min_h <= bh <= max_h):
+            continue
+        fill = area / max(1, bw * bh)
+        if fill < 0.45:
+            continue
+
+        # Point-to-rectangle distance from hover_point
+        dx = max(bx - hx, 0, hx - (bx + bw))
+        dy = max(by - hy, 0, hy - (by + bh))
+        dist = math.hypot(dx, dy)
+        if dist > max_dist:
+            continue
+
+        patch_v = hsv_after[by : by + bh, bx : bx + bw, 2]
+        if patch_v.size == 0 or float(np.mean(patch_v <= 80)) < 0.25:
+            continue
+
+        if dist < best_dist:
+            best_dist = dist
+            best_bbox = (bx, by, bw, bh)
+
+    if best_bbox is None:
+        return None
+
+    bx, by, bw, bh = best_bbox
+    pad = max(2, int(round(3 * scale)))
+    x1 = max(0, bx - pad)
+    y1 = max(0, by - pad)
+    x2 = min(w, bx + bw + pad)
+    y2 = min(h, by + bh + pad)
+    return np.ascontiguousarray(after_frame[y1:y2, x1:x2], dtype=np.uint8)
+
+
+def classify_upgrade_tooltip(
+    lines: Sequence[str],
+    blocked_keywords: Sequence[str] = ("board",),
+) -> TooltipClassification:
+    """Classify OCR tooltip lines into safe, blocked, unlocked, or unreadable (fail-closed)."""
+    cleaned = [str(line).strip() for line in lines if str(line).strip()]
+    if not cleaned:
+        return TooltipClassification(
+            status="unreadable",
+            title="",
+            lines=(),
+            reason="empty_ocr",
+        )
+
+    title = cleaned[0]
+    joined = " ".join(cleaned)
+    joined_lower = joined.lower()
+
+    if _UNLOCKED_REGEX.search(joined):
+        return TooltipClassification(
+            status="unlocked",
+            title=title,
+            lines=tuple(cleaned),
+            reason="unlocked",
+        )
+
+    for kw in blocked_keywords:
+        token = str(kw).strip().lower()
+        if token and token in joined_lower:
+            return TooltipClassification(
+                status="blocked",
+                title=title,
+                lines=tuple(cleaned),
+                reason=f"keyword:{token}",
+            )
+
+    for pattern in _BOARD_FUZZY_REGEXES:
+        if pattern.search(joined):
+            return TooltipClassification(
+                status="blocked",
+                title=title,
+                lines=tuple(cleaned),
+                reason=f"board_regex:{pattern.pattern}",
+            )
+
+    return TooltipClassification(
+        status="safe",
+        title=title,
+        lines=tuple(cleaned),
+        reason="ok",
     )
 
 
@@ -282,9 +619,13 @@ def render_upgrade_debug_overlay(
     frame: np.ndarray,
     result: TreeScanResult,
     scope: str = "main_only",
+    min_start_height_px: int = 30,
+    max_start_height_px: int = 44,
 ) -> np.ndarray:
-    """Draw annotated tree bounding box, detected tiles, click points, and edge flags."""
+    """Draw annotated tree bounding box, Start anchor, detected tiles, and edge/zoom status."""
     vis = frame.copy()
+    h, w = vis.shape[:2]
+    scale = min(w / 1280.0, h / 720.0)
 
     if result.main_tree_bbox is not None:
         mx, my, mw, mh = result.main_tree_bbox
@@ -299,6 +640,40 @@ def render_upgrade_debug_overlay(
             2,
             cv2.LINE_AA,
         )
+
+    zoom_status = "NO_START"
+    start_h_label = "none"
+    if result.start_anchor is not None:
+        sa = result.start_anchor
+        sx, sy, sw, sh = sa.bbox
+        cv2.rectangle(vis, (sx, sy), (sx + sw, sy + sh), (255, 200, 0), 2)
+        cv2.drawMarker(
+            vis,
+            sa.center,
+            (0, 255, 128),
+            markerType=cv2.MARKER_CROSS,
+            markerSize=14,
+            thickness=2,
+        )
+        cv2.putText(
+            vis,
+            f"START h={sa.height_px}px",
+            (sx, max(18, sy - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 220, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        min_scaled = max(10, int(round(min_start_height_px * scale)))
+        max_scaled = max(min_scaled + 4, int(round(max_start_height_px * scale)))
+        start_h_label = f"{sa.height_px}px"
+        if sa.height_px < min_scaled:
+            zoom_status = "TOO_SMALL"
+        elif sa.height_px > max_scaled:
+            zoom_status = "TOO_BIG"
+        else:
+            zoom_status = "OK"
 
     active_ranks = {c.click_point: idx + 1 for idx, c in enumerate(result.candidates)}
 
@@ -330,15 +705,15 @@ def render_upgrade_debug_overlay(
     edges_text = ",".join(sorted(result.clipped_edges)) if result.clipped_edges else "none"
     summary = (
         f"scope={scope} | active={len(result.candidates)} | total={len(result.all_candidates)} | "
-        f"clipped={edges_text}"
+        f"start_h={start_h_label} ({zoom_status}) | cov={result.tree_coverage_ratio:.2f} | clipped={edges_text}"
     )
-    cv2.rectangle(vis, (8, 8), (min(vis.shape[1] - 8, 680), 34), (15, 15, 15), -1)
+    cv2.rectangle(vis, (8, 8), (min(vis.shape[1] - 8, 980), 34), (15, 15, 15), -1)
     cv2.putText(
         vis,
         summary,
         (14, 26),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.50,
         (255, 255, 255),
         1,
         cv2.LINE_AA,

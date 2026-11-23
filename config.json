@@ -18,6 +18,8 @@
     "hud_in_run": 0.85,
     "btn_upgrades": 0.85,
     "btn_upgrades_close": 0.85,
+    "btn_spawners": 0.85,
+    "btn_spawners_close": 0.85,
     "dismiss": 0.85
   },
   "rois": {
@@ -80,6 +82,18 @@
       0.85,
       0.62,
       1.0
+    ],
+    "btn_spawners": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "btn_spawners_close": [
+      0.66,
+      0.05,
+      0.76,
+      0.18
     ]
   },
   "polling": {
@@ -93,6 +107,7 @@
     "launching_sec": 180.0,
     "launching_update_grace_sec": 300.0,
     "ready_to_start_sec": 120.0,
+    "purchasing_spawners_sec": 120.0,
     "upgrading_sec": 60.0,
     "in_run_sec": 2700.0,
     "disconnected_sec": 90.0
@@ -112,6 +127,19 @@
     "resume_mode": "continue",
     "stop_on_same_account": true
   },
+  "auto_spawner": {
+    "enabled": true,
+    "every_n_runs": 1,
+    "run_on_start": true,
+    "max_purchases_per_pass": 80,
+    "pass_timeout_sec": 90.0,
+    "scroll_notches_per_step": 5,
+    "max_scroll_steps": 15,
+    "clicks_per_pill": 5,
+    "click_hover_sec": 0.12,
+    "click_interval_sec": 0.35,
+    "round_settle_sec": 1.0
+  },
   "auto_upgrade": {
     "enabled": true,
     "every_n_runs": 1,
@@ -125,7 +153,16 @@
     "max_purchases_per_pass": 25,
     "pass_timeout_sec": 45.0,
     "post_click_settle_sec": 0.35,
-    "tile_click_y_offset_px": -14
+    "tile_click_y_offset_px": -14,
+    "blocked_keywords": [
+      "board"
+    ],
+    "fail_closed_tooltip_check": true,
+    "hover_settle_sec": 0.14,
+    "adaptive_zoom": true,
+    "min_start_tile_height_px": 30,
+    "max_start_tile_height_px": 44,
+    "center_tolerance_px": 60
   },
   "logging": {
     "max_failure_snapshots": 20

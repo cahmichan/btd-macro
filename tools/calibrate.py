@@ -13,6 +13,7 @@ import numpy as np
 
 from src.config import get_assets_dir, get_dismiss_dir, get_logs_dir, load_config
 from src.controller import RobloxController
+from src.spawner_vision import detect_spawner_buy_buttons, render_spawner_debug_overlay
 from src.upgrade_vision import detect_affordable_upgrades, render_upgrade_debug_overlay
 from src.vision import (
     OPTIONAL_TEMPLATES,
@@ -180,6 +181,18 @@ def run_confidence_monitor(
                 cfg.thresholds.btn_upgrades_close,
                 cfg.rois.btn_upgrades_close,
             )
+            spawners = vision.find(
+                frame,
+                "btn_spawners",
+                cfg.thresholds.btn_spawners,
+                cfg.rois.btn_spawners,
+            )
+            spawners_close = vision.find(
+                frame,
+                "btn_spawners_close",
+                cfg.thresholds.btn_spawners_close,
+                cfg.rois.btn_spawners_close,
+            )
             same_acct = vision.find(
                 frame,
                 "modal_same_account",
@@ -201,6 +214,10 @@ def run_confidence_monitor(
                 parts.append(f"Upgrades={up.confidence:.3f}{'*' if up.found else ''}")
             if vision.has_template("btn_upgrades_close"):
                 parts.append(f"UpgradesClose={up_close.confidence:.3f}{'*' if up_close.found else ''}")
+            if vision.has_template("btn_spawners"):
+                parts.append(f"Spawners={spawners.confidence:.3f}{'*' if spawners.found else ''}")
+            if vision.has_template("btn_spawners_close"):
+                parts.append(f"SpawnersClose={spawners_close.confidence:.3f}{'*' if spawners_close.found else ''}")
             if vision.has_template("modal_same_account"):
                 parts.append(f"SameAcct={same_acct.confidence:.3f}{'*' if same_acct.found else ''}")
             if dismiss is not None:
@@ -239,11 +256,28 @@ def run_test_upgrades(
     main_cands = [c for c in result.all_candidates if c.is_main_tree]
     side_cands = [c for c in result.all_candidates if not c.is_main_tree]
     edges_str = ",".join(sorted(result.clipped_edges)) if result.clipped_edges else "none"
+    scale = min(frame.shape[1] / 1280.0, frame.shape[0] / 720.0)
+    if result.start_anchor is None:
+        start_info = "none"
+        zoom_status = "NO_START"
+    else:
+        sa = result.start_anchor
+        min_h = max(10, int(round(cfg.min_start_tile_height_px * scale)))
+        max_h = max(min_h + 4, int(round(cfg.max_start_tile_height_px * scale)))
+        if sa.height_px < min_h:
+            zoom_status = f"TOO_SMALL (<{min_h})"
+        elif sa.height_px > max_h:
+            zoom_status = f"TOO_BIG (>{max_h})"
+        else:
+            zoom_status = f"OK ([{min_h}, {max_h}])"
+        start_info = f"center={sa.center}, h={sa.height_px}px [{zoom_status}]"
 
     print(
         f"\n[UPGRADE VISION] frame={frame.shape[1]}x{frame.shape[0]} | scope={active_scope} | "
-        f"main_bbox={result.main_tree_bbox} | clipped_edges={edges_str}"
+        f"main_bbox={result.main_tree_bbox} | coverage={result.tree_coverage_ratio:.3f} | "
+        f"clipped_edges={edges_str}"
     )
+    print(f"  Start Anchor: {start_info}")
     print(
         f"  Detected: main={len(main_cands)}, side={len(side_cands)}, "
         f"active({active_scope})={len(result.candidates)}"
@@ -264,7 +298,13 @@ def run_test_upgrades(
                 f"bbox={cand.bbox} px={cand.raw_pixels}"
             )
 
-    preview = render_upgrade_debug_overlay(frame, result, scope=active_scope)
+    preview = render_upgrade_debug_overlay(
+        frame,
+        result,
+        scope=active_scope,
+        min_start_height_px=cfg.min_start_tile_height_px,
+        max_start_height_px=cfg.max_start_tile_height_px,
+    )
     preview_path = get_logs_dir() / "upgrade_vision_preview.png"
     if _write_png_image(preview_path, preview):
         print(f"[SAVED] Annotated preview written to {preview_path}")
@@ -273,6 +313,48 @@ def run_test_upgrades(
 
     if not no_gui:
         win_title = "Upgrade Vision Preview (Press any key to close)"
+        cv2.imshow(win_title, preview)
+        cv2.waitKey(0)
+        cv2.destroyWindow(win_title)
+
+    return 0
+
+
+def run_test_spawners(
+    controller: RobloxController,
+    vision: VisionEngine,
+    image_path: Optional[Path] = None,
+    resize_1280x720: bool = False,
+    no_gui: bool = False,
+) -> int:
+    """Run Spawner Shop Buy-pill vision on a live Roblox frame or PNG file and save an annotated preview."""
+    frame = _capture_source_frame(controller, vision, from_image=image_path)
+    if frame is None:
+        return 1
+
+    if resize_1280x720 and (frame.shape[1], frame.shape[0]) != (1280, 720):
+        frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_AREA)
+
+    result = detect_spawner_buy_buttons(frame)
+    print(
+        f"\n[SPAWNER VISION] frame={frame.shape[1]}x{frame.shape[0]} | "
+        f"grid_roi={result.grid_roi_px} | green_buy_pills={len(result.buttons)}"
+    )
+    for idx, btn in enumerate(result.buttons, start=1):
+        print(
+            f"  #{idx:02d} row={btn.row_index} col={btn.col_index} center={btn.center} "
+            f"bbox={btn.bbox} fill={btn.fill_ratio:.2f}"
+        )
+
+    preview = render_spawner_debug_overlay(frame, result)
+    preview_path = get_logs_dir() / "spawner_vision_preview.png"
+    if _write_png_image(preview_path, preview):
+        print(f"[SAVED] Annotated preview written to {preview_path}")
+    else:
+        print(f"[WARN] Could not write annotated preview to {preview_path}")
+
+    if not no_gui:
+        win_title = "Spawner Vision Preview (Press any key to close)"
         cv2.imshow(win_title, preview)
         cv2.waitKey(0)
         cv2.destroyWindow(win_title)
@@ -294,6 +376,8 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
         "10": "modal_same_account",
         "11": "btn_upgrades",
         "12": "btn_upgrades_close",
+        "13": "btn_spawners",
+        "14": "btn_spawners_close",
     }
 
     while True:
@@ -310,12 +394,15 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
         print("10. Capture & crop modal_same_account.png (Optional Error 273 guard text)")
         print("11. Capture & crop btn_upgrades.png       (Optional Auto-Upgrade lobby button)")
         print("12. Capture & crop btn_upgrades_close.png (Optional Auto-Upgrade Close button)")
-        print("13. Capture & crop optional dismiss/*.png popup")
-        print("14. Live Dry-Run Confidence Monitor")
-        print("15. Test Auto-Upgrade vision on live tree or PNG")
-        print("16. Exit")
+        print("13. Capture & crop btn_spawners.png       (Optional Auto-Spawners lobby button)")
+        print("14. Capture & crop btn_spawners_close.png (Optional Spawner Shop red X button)")
+        print("15. Capture & crop optional dismiss/*.png popup")
+        print("16. Live Dry-Run Confidence Monitor")
+        print("17. Test Auto-Upgrade vision on live tree or PNG")
+        print("18. Test Auto-Spawner vision on live shop or PNG")
+        print("19. Exit")
 
-        choice = input("Select option [1-16]: ").strip()
+        choice = input("Select option [1-19]: ").strip()
         if choice == "1":
             snap_roblox(controller)
         elif choice == "2":
@@ -333,7 +420,7 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
             ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
             src = Path(ans.strip('"')) if ans else None
             crop_template_interactive(name, assets_dir / f"{name}.png", controller, vision, src)
-        elif choice == "13":
+        elif choice == "15":
             popup_name = input("Enter filename for dismiss template (e.g., popup_close): ").strip()
             if popup_name:
                 ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
@@ -345,13 +432,17 @@ def _interactive_menu(controller: RobloxController, vision: VisionEngine) -> int
                     vision,
                     src,
                 )
-        elif choice == "14":
+        elif choice == "16":
             run_confidence_monitor(controller, vision)
-        elif choice == "15":
+        elif choice == "17":
             ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
             src = Path(ans.strip('"')) if ans else None
             run_test_upgrades(controller, vision, image_path=src)
-        elif choice == "16":
+        elif choice == "18":
+            ans = input("Press ENTER to capture live Roblox, or enter a screenshot path: ").strip()
+            src = Path(ans.strip('"')) if ans else None
+            run_test_spawners(controller, vision, image_path=src)
+        elif choice == "19":
             return 0
         else:
             print("Invalid choice.")
@@ -381,6 +472,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Test upgrade tree detection on live Roblox or an optional PNG screenshot.",
     )
     parser.add_argument(
+        "--test-spawners",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="IMAGE_PATH",
+        help="Test Spawner Shop Buy pill detection on live Roblox or an optional PNG screenshot.",
+    )
+    parser.add_argument(
         "--scope",
         choices=["main_only", "main_then_sides"],
         default=None,
@@ -389,12 +488,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--resize-1280x720",
         action="store_true",
-        help="Resize input image to 1280x720 before running --test-upgrades.",
+        help="Resize input image to 1280x720 before running vision tests.",
     )
     parser.add_argument(
         "--no-gui",
         action="store_true",
-        help="Save annotated preview without opening a GUI window during --test-upgrades.",
+        help="Save annotated preview without opening a GUI window during vision tests.",
     )
     args = parser.parse_args(argv)
 
@@ -432,6 +531,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             vision,
             image_path=src_img,
             scope=args.scope,
+            resize_1280x720=args.resize_1280x720,
+            no_gui=args.no_gui,
+        )
+    if args.test_spawners is not None:
+        src_img = Path(args.test_spawners) if args.test_spawners else None
+        return run_test_spawners(
+            controller,
+            vision,
+            image_path=src_img,
             resize_1280x720=args.resize_1280x720,
             no_gui=args.no_gui,
         )

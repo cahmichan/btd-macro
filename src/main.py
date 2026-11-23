@@ -86,8 +86,10 @@ def main() -> int:
     finally:
         if hotkey_listener is not None:
             hotkey_listener.stop()
-        if fsm is not None and fsm.is_running:
-            fsm.stop("Shutdown")
+        if fsm is not None:
+            if fsm.is_running:
+                fsm.stop("Shutdown")
+            fsm.close()
         allow_sleep()
         guard.release()
 

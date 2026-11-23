@@ -35,6 +35,8 @@ class ThresholdConfig:
     hud_in_run: float = 0.85
     btn_upgrades: float = 0.85
     btn_upgrades_close: float = 0.85
+    btn_spawners: float = 0.85
+    btn_spawners_close: float = 0.85
     dismiss: float = 0.85
 
 
@@ -52,6 +54,8 @@ class RoiConfig:
     hud_in_run: list[float] = field(default_factory=lambda: [0.22, 0.74, 0.78, 1.0])
     btn_upgrades: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
     btn_upgrades_close: list[float] = field(default_factory=lambda: [0.38, 0.85, 0.62, 1.0])
+    btn_spawners: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
+    btn_spawners_close: list[float] = field(default_factory=lambda: [0.66, 0.05, 0.76, 0.18])
 
 
 @dataclass
@@ -72,6 +76,7 @@ class TimeoutConfig:
     launching_sec: float = 180.0
     launching_update_grace_sec: float = 300.0
     ready_to_start_sec: float = 120.0
+    purchasing_spawners_sec: float = 120.0
     upgrading_sec: float = 60.0
     in_run_sec: float = 2700.0
     disconnected_sec: float = 90.0
@@ -101,6 +106,28 @@ class RecoveryConfig:
 
 
 @dataclass
+class AutoSpawnerConfig:
+    """Between-run and startup Spawner Shop automation settings."""
+
+    enabled: bool = False
+    every_n_runs: int = 1
+    run_on_start: bool = True
+    # Hard cap on Buy clicks per pass (safety net).
+    max_purchases_per_pass: int = 80
+    pass_timeout_sec: float = 90.0
+    scroll_notches_per_step: int = 5
+    max_scroll_steps: int = 15
+    # Click every green Buy pill on a page, rescan, repeat: at most this many rounds per page
+    # (covers multi-stock items; pills still green after the last round = likely out of cash).
+    clicks_per_pill: int = 5
+    # Hover the Buy pill this long before clicking (Roblox ignores instant clicks).
+    click_hover_sec: float = 0.12
+    # Gap after each Buy click, and pause before rescanning a page (lets laggy servers catch up).
+    click_interval_sec: float = 0.35
+    round_settle_sec: float = 1.0
+
+
+@dataclass
 class AutoUpgradeConfig:
     """Between-run and startup hex upgrade tree automation settings."""
 
@@ -117,6 +144,13 @@ class AutoUpgradeConfig:
     pass_timeout_sec: float = 45.0
     post_click_settle_sec: float = 0.35
     tile_click_y_offset_px: int = -14
+    blocked_keywords: list[str] = field(default_factory=lambda: ["board"])
+    fail_closed_tooltip_check: bool = True
+    hover_settle_sec: float = 0.14
+    adaptive_zoom: bool = True
+    min_start_tile_height_px: int = 30
+    max_start_tile_height_px: int = 44
+    center_tolerance_px: int = 60
 
 
 @dataclass
@@ -147,6 +181,7 @@ class AppConfig:
     timeouts: TimeoutConfig = field(default_factory=TimeoutConfig)
     anti_afk: AntiAfkConfig = field(default_factory=AntiAfkConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    auto_spawner: AutoSpawnerConfig = field(default_factory=AutoSpawnerConfig)
     auto_upgrade: AutoUpgradeConfig = field(default_factory=AutoUpgradeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ui: UiConfig = field(default_factory=UiConfig)
@@ -200,7 +235,12 @@ def _merge_dataclass(cls: type[T], raw: Any) -> T:
         if is_dataclass(default_val) and isinstance(incoming, dict):
             kwargs[f.name] = _merge_dataclass(type(default_val), incoming)
         elif isinstance(default_val, list) and isinstance(incoming, list):
-            kwargs[f.name] = [float(v) for v in incoming] if len(incoming) == 4 else default_val
+            if default_val and all(isinstance(v, str) for v in default_val):
+                kwargs[f.name] = [str(v) for v in incoming]
+            elif len(incoming) == 4:
+                kwargs[f.name] = [float(v) for v in incoming]
+            else:
+                kwargs[f.name] = default_val
         elif isinstance(default_val, bool):
             kwargs[f.name] = bool(incoming)
         elif isinstance(default_val, int) and not isinstance(default_val, bool):
